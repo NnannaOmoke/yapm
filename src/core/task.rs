@@ -57,6 +57,8 @@ impl ChildWrapper {
         };
         None
     }
+    //TODO: read stderr and stdin to a writable (is this not meant to be non_blocking?)
+    //TODO:
 }
 
 //add task permissions:
@@ -178,7 +180,7 @@ impl Drop for Task {
         if let Err(e) = self.kill() {
             //the process still no gree die - we crash the program and have the OS SIGKILL the parent process
             //we cannot allow zombies at all
-            let id = std::process::id();
+            let id = id();
             resolve_os_declarations!(let _ = linux::kill_process_sigkill(id as i32), None);
         } //kill the underlying process
     }
@@ -186,8 +188,11 @@ impl Drop for Task {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+
+    use std::thread::sleep;
+
+    use std::time::Duration;
 
     #[test]
     fn test_proper_init() {
@@ -233,4 +238,18 @@ mod tests {
         let task = Task::new(&empty_arg_set);
         task.unwrap();
     }
+
+    #[test]
+    fn test_running_exec() {
+        let arg_set_echo = &["examples/test_one.sh".to_string()];
+        let mut task = Task::new(arg_set_echo).unwrap();
+        let _ = task.start();
+        println!("The PID created: {}", task.inner.getpid().unwrap());
+        sleep(Duration::new(200, 0));
+        let _ = task.kill();
+        assert!(true);
+    }
+    //god im too tired to write this today
+    #[test]
+    fn test_running_exec_and_post_query() {}
 }
