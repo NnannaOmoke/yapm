@@ -1,0 +1,10 @@
+[package]
+name = "yapm"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nix = {version = "0.29.0", features = ["acct", "process", "signal", "ptrace"]}
+thiserror = "2.0.3"
