@@ -17,10 +17,10 @@ pub enum LinuxErrorManager {
     #[error("SIGKILL could not terminate the running process; YAPM does not have the neccessary permissions to terminate the child process")]
     SigKillNoPerm,
     #[error(
-        "SIGKILL could not terminate the process; It either does not exist or has been terminated already"
+        "SIGKILL could not terminate the target process; It either does not exist or has been terminated already"
     )]
     SigKillNoExist,
-    #[error("{}", .0)]
+    #[error("There has been an unknown error: {}", .0)]
     UnexpectedError(Errno),
 }
 

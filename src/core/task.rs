@@ -1,6 +1,9 @@
 use std::fs::File;
 
+use std::error::Error as MajorError;
+
 use std::io::Error;
+use std::io::Read;
 
 use std::time::Instant;
 
@@ -17,7 +20,7 @@ use crate::resolve_os_declarations;
 
 const PYTHON_PATH: &'static str = "$PYTHON";
 const JAVASCRIPT_PATH: &'static str = "$";
-const TYPESCRIPT_PATH: &'_ str = "$";
+const TYPESCRIPT_PATH: &'static str = "$";
 
 #[derive(Debug, PartialEq)]
 pub enum TaskType {
@@ -46,7 +49,9 @@ impl ChildWrapper {
 
     fn kill(&mut self) -> TaskResult<()> {
         if let Self::Started(handle) = self {
-            handle.kill()?
+            handle.kill()?;
+            //we'll have to use ASYNC for this or massive multithreading
+            handle.wait()?;
         };
         Ok(())
     }
@@ -57,8 +62,14 @@ impl ChildWrapper {
         };
         None
     }
-    //TODO: read stderr and stdin to a writable (is this not meant to be non_blocking?)
-    //TODO:
+    //TODO: read stderr and stdin to a writable (this blocks?)
+    #[cfg(debug_assertions)]
+    fn read_to_string(&mut self, s: &mut String) -> Result<(), Box<dyn MajorError>> {
+        if let Self::Started(handle) = self {
+            let _ = handle.stderr.take().unwrap().read_to_string(s)?; //will block, do it async-ly
+        }
+        Ok(())
+    }
 }
 
 //add task permissions:
@@ -85,23 +96,12 @@ pub struct Task {
 pub enum TaskError {
     #[error("The input task to execute is not in a parseable format")]
     BadInputFormat,
-    #[error("The executable could not be launched: {}", .0)]
-    UnlaunchableExecutable(#[from] Error),
-    #[error("The process could not be killed: {}", .0)]
-    FailedProcessTermination(LinuxErrorManager),
-    #[error("This operation has failed: Error code: {}", .0)]
-    UnknownProcessError(LinuxErrorManager),
-}
-
-impl From<LinuxErrorManager> for TaskError {
-    fn from(err: LinuxErrorManager) -> Self {
-        match err {
-            LinuxErrorManager::SigKillNoPerm | LinuxErrorManager::SigKillNoExist => {
-                TaskError::FailedProcessTermination(err)
-            }
-            LinuxErrorManager::UnexpectedError(_) => TaskError::UnknownProcessError(err),
-        }
-    }
+    #[error("There has been an I/O operations error: {}", .0)]
+    InternalIOError(#[from] Error),
+    #[error("The Linux syscall has failed: {}", .0)]
+    InternalLinuxAPIError(#[from] LinuxErrorManager),
+    #[error("The Error is of unknown origin")]
+    UnknownProcessError,
 }
 
 type TaskResult<T> = Result<T, TaskError>;
@@ -194,6 +194,10 @@ mod tests {
 
     use std::time::Duration;
 
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
     #[test]
     fn test_proper_init() {
         let arg_set_py = vec!["app.py".to_string()];
@@ -245,11 +249,37 @@ mod tests {
         let mut task = Task::new(arg_set_echo).unwrap();
         let _ = task.start();
         println!("The PID created: {}", task.inner.getpid().unwrap());
-        sleep(Duration::new(200, 0));
+        sleep(Duration::new(1, 0));
         let _ = task.kill();
         assert!(true);
     }
+    //test structure: create task, capture its PID, kill task, get all tasks running in the OS currently, and check
+    //if the PID is in the task-list, if it is, it's a zombie, and we've failed the test
+    //otherwise we're good
     //god im too tired to write this today
     #[test]
-    fn test_running_exec_and_post_query() {}
+    fn test_running_exec_and_post_query() {
+        let arg_set_echo = &["examples/test_one.sh".to_string()];
+        let mut task = Task::new(arg_set_echo).unwrap();
+        let _ = task.start();
+        let pid = task.inner.getpid().unwrap();
+        println!("The PID created: {}", pid);
+        sleep(Duration::new(1, 0));
+        task.kill().unwrap();
+        assert!(kill(Pid::from_raw(pid), None).err() == Some(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_captured_io() {
+        let arg_set_echo = &["examples/test_one.sh".to_string()];
+        let mut task = Task::new(arg_set_echo).unwrap();
+        let mut s = String::new();
+        let _ = task.start();
+        task.inner.read_to_string(&mut s).unwrap();
+        sleep(Duration::new(1, 0));
+        task.kill().unwrap();
+        //we can capture stdout/stderr, but it's blocking
+        //to fix that, we need it to be non-blocking and wrapped in an async block
+        assert_eq!(s, String::from("hello, i'm running\nhello, i'm dying\n"));
+    }
 }

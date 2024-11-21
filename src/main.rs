@@ -1,7 +1,16 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+//TODO: there needs to be a parked thread to reap processes
+//Solution: create a task.rs to manage these thread managers
+//TODO: we need to be able to collect input from child processes
+//Solution: This is something we have to test and work on now, probably by finding non-blocking ways to collect process input
+//TODO: probably use async for the more I/O intensive read-writes for logging
+//Solution: get the crates: aysnc-fs, pollster, futures, but this will all be done in the logging.rs and threads.rs
+//
+
 mod core;
+mod threads;
 
 fn main() {}
 
