@@ -1,10 +1,10 @@
-use std::fs::File;
-
 use std::error::Error as MajorError;
 
 use std::io::Error;
 use std::io::Read;
 
+use std::process::ChildStderr;
+use std::process::ChildStdout;
 use std::time::Instant;
 
 use std::process::id;
@@ -14,6 +14,7 @@ use std::process::Stdio;
 
 use thiserror::Error;
 
+use crate::core::logging::ProcessLogger;
 use crate::core::platform::linux;
 use crate::core::platform::linux::LinuxErrorManager;
 use crate::resolve_os_declarations;
@@ -52,6 +53,8 @@ impl ChildWrapper {
             handle.kill()?;
             //we'll have to use ASYNC for this or massive multithreading
             handle.wait()?;
+        } else {
+            return Err(TaskError::ProcessStateUnitialized);
         };
         Ok(())
     }
@@ -62,6 +65,18 @@ impl ChildWrapper {
         };
         None
     }
+
+    //gets the handles to the stdout and the stderr
+    fn gethandles(&mut self) -> TaskResult<(ChildStderr, ChildStdout)> {
+        if let Self::Started(handle) = self {
+            let handle_out = handle.stdout.take().unwrap();
+            let handle_err = handle.stderr.take().unwrap();
+            Ok((handle_err, handle_out))
+        } else {
+            Err(TaskError::ProcessStateUnitialized)
+        }
+    }
+
     //TODO: read stderr and stdin to a writable (this blocks?)
     #[cfg(debug_assertions)]
     fn read_to_string(&mut self, s: &mut String) -> Result<(), Box<dyn MajorError>> {
@@ -86,8 +101,9 @@ pub struct Task {
     executor: String,
     //when the task is started
     start: Option<Instant>,
-    //log-file
-    file: Option<File>,
+    //we need a way of plugging in the stdout and stderr handles to the process logger.
+    //so we probably can expose a handle function?
+    logger: Option<ProcessLogger>,
     //the task type
     task_type: TaskType,
 }
@@ -100,6 +116,8 @@ pub enum TaskError {
     InternalIOError(#[from] Error),
     #[error("The Linux syscall has failed: {}", .0)]
     InternalLinuxAPIError(#[from] LinuxErrorManager),
+    #[error("A call has been made to a non-started child process")]
+    ProcessStateUnitialized,
     #[error("The Error is of unknown origin")]
     UnknownProcessError,
 }
@@ -143,14 +161,13 @@ impl Task {
             TaskType::Javascript => String::from(JAVASCRIPT_PATH),
             TaskType::Typescript => String::from(TYPESCRIPT_PATH),
         };
-        let log_file = None;
         let inner = ChildWrapper::Initialized;
         let start = None; //we'll overwrite this later when we start the process, no need to rewrite it twice
         Ok(Self {
             inner,
             args,
             start,
-            file: log_file,
+            logger: None,
             task_type,
             executor,
         })
@@ -160,6 +177,10 @@ impl Task {
     //we will start with very simple stuff, and test extensively as we go on
     fn start(&mut self) -> TaskResult<()> {
         let (fprocess_handle, start) = ChildWrapper::new(&self.executor, &self.args)?;
+        //proccessing this shit is annoying, honestly
+        //what if the person wants to execute the stuff with args?
+        //well the process run will encapsulate the virtual interpreter instead of the file itself
+        //the initial thing was just sugar to resolve the interpreter dependencies instead
         self.start = Some(start);
         self.inner = fprocess_handle;
         Ok(())
@@ -171,6 +192,16 @@ impl Task {
             let pid = self.inner.getpid().unwrap();
             resolve_os_declarations!(linux::kill_process_sigkill(pid)?, None);
         }
+        Ok(())
+    }
+
+    //this sets the internal state of the loggers; i.e. points them to the valid stdout and stderr
+    //now the next thing is to define functions in logging to handle the streaming of the process information
+    fn set_internal_handles(&mut self) -> TaskResult<()> {
+        let (err, out) = self.inner.gethandles()?;
+        if let Some(lg) = &mut self.logger {
+            lg.set_handles(err, out);
+        };
         Ok(())
     }
 }
@@ -208,7 +239,7 @@ mod tests {
                 inner: ChildWrapper::Initialized,
                 args: Vec::new(),
                 start: None,
-                file: None,
+                logger: None,
                 task_type: TaskType::Python,
                 executor: PYTHON_PATH.to_string()
             }
@@ -228,7 +259,7 @@ mod tests {
                     "/dev/null".to_string()
                 ],
                 start: None,
-                file: None,
+                logger: None,
                 task_type: TaskType::Executable,
                 executor: "echo".to_string()
             }

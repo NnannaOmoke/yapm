@@ -4,12 +4,16 @@ use std::fs::File;
 
 use std::path::PathBuf;
 
+use std::process::ChildStderr;
+use std::process::ChildStdout;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use thiserror::Error;
 
-use crate::core::task::Task;
+use crate::core::task::TaskError;
+use crate::threads::AsyncTask;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_LOG_DIR_LOCATION: &'static str = "/usr/bin/yapm/logs";
@@ -32,19 +36,26 @@ pub enum LoggingError {
     AssertionError { msg: String },
     #[error("An I/O error occured: {}", .0)]
     IOError(#[from] std::io::Error),
+    #[error("{}", .0)]
+    TaskError(#[from] TaskError),
 }
 
 type LogOpResult<T> = Result<T, LoggingError>;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum FMaxSize {
     Infinite,
     Capped(usize), //in kbs is reasonable
 }
 
+//do we not need to give the handles to the processlogger to manage?
+//so that all of that can be managed here
+#[derive(Debug)]
 pub struct ProcessLogger {
-    stderr: Arc<Mutex<File>>,
-    stdout: Arc<Mutex<File>>,
+    stderr: File,
+    stdout: File,
+    stderr_src: Option<ChildStderr>,
+    stdout_src: Option<ChildStdout>,
     fmax_size: FMaxSize,
     pid: i32, //incase we need to do any weird stuff with the linux ABI
 }
@@ -124,20 +135,44 @@ impl ProcessLogger {
                 (outhandle, errhandle)
             };
 
-        let mutex_err = Mutex::new(fhandlerr);
-        let mutex_out = Mutex::new(fhandleout);
+        // let mutex_err = Mutex::new(fhandlerr);
+        // let mutex_out = Mutex::new(fhandleout);
 
-        let arc_err = Arc::new(mutex_err);
-        let arc_out = Arc::new(mutex_out);
+        // let arc_err = Arc::new(mutex_err);
+        // let arc_out = Arc::new(mutex_out);
 
         let max_fsize = FMaxSize::Capped(4096);
 
         return Ok(Self {
-            stderr: arc_err,
-            stdout: arc_out,
+            stderr: fhandlerr,
+            stdout: fhandleout,
             fmax_size: max_fsize,
+            stderr_src: None,
+            stdout_src: None,
             pid,
         });
+    }
+
+    pub fn set_handles(&mut self, stderr: ChildStderr, stdout: ChildStdout) {
+        self.stderr_src = Some(stderr);
+        self.stdout_src = Some(stdout);
+    }
+
+    //the next thing to do is to handle the streaming;
+    //we will firstly, maybe define a task struct to handle this?
+    //we need to find a way to tell the parked thread how to handle the incomign tasks
+    //;everything should be handled async-ly by the thread. We construct an instance of a threadtask and use mspc to send it there
+    fn create_and_send_stream_task(&mut self) -> LogOpResult<()> {
+        let (err, out) =
+            if let (Some(err), Some(out)) = (self.stderr_src.take(), self.stdout_src.take()) {
+                (err, out)
+            } else {
+                return Err(LoggingError::TaskError(TaskError::ProcessStateUnitialized));
+            };
+        let err_clone = self.stderr.try_clone()?;
+        let out_clone = self.stdout.try_clone()?;
+        let task = AsyncTask::StreamIOToFile(err, out, err_clone, out_clone);
+        Ok(())
     }
 }
 

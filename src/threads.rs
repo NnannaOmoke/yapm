@@ -1,7 +1,14 @@
+use std::fs::File;
+
+use std::process::ChildStderr;
+use std::process::ChildStdout;
+
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
-fn io_executor<T>(task: Receiver<T>) {
-    loop {}
+pub enum AsyncTask {
+    StreamIOToFile(ChildStderr, ChildStdout, File, File),
+    KillThread,
 }
