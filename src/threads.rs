@@ -12,6 +12,8 @@ use std::process::ChildStdout;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 use time::error::IndeterminateOffset;
@@ -30,19 +32,28 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
+use tokio::task::JoinHandle;
+
 pub enum AsyncTask {
     StreamIOToFile(ChildStderr, ChildStdout, File, File, i32),
-    KillThread,
+    KillThread(i32),
 }
 
 #[derive(Debug, Error)]
 pub enum AsyncError {
     #[error("Unknown Error")]
     UnknownAsyncError,
+    #[error("Uninitialized Runtime")]
+    UnitializedRuntimeError,
     #[error("I/O error: {}", .0)]
     AysncIOError(#[from] std::io::Error),
     #[error("Time init error: {}", .0)]
     TimeError(#[from] IndeterminateOffset),
+}
+
+enum RuntimeState {
+    Running,
+    Unavailable,
 }
 
 type AsyncResult<T> = Result<T, AsyncError>;
@@ -50,32 +61,59 @@ type AsyncResult<T> = Result<T, AsyncError>;
 pub struct GlobalAysncIOManager {
     rt: Runtime,
     sender: UnboundedSender<AsyncTask>,
+    state: RuntimeState,
 }
 
 impl GlobalAysncIOManager {
-    pub fn new() -> AsyncResult<Self> {
+    pub fn new(glv: Arc<Mutex<VecDeque<String>>>) -> AsyncResult<Self> {
         let (tx, rx) = unbounded_channel();
         let rt = Builder::new_current_thread()
             .worker_threads(4)
             .thread_name("YAPM async handler")
             .build()?;
-        rt.spawn(Self::coordinator(rx));
-        Ok(Self { sender: tx, rt })
+        rt.spawn(Self::coordinator(rx, glv));
+        Ok(Self {
+            sender: tx,
+            rt,
+            state: RuntimeState::Running,
+        })
     }
 
-    pub fn give_sender(&self) -> UnboundedSender<AsyncTask> {
-        self.sender.clone()
+    pub fn give_sender(&self) -> AsyncResult<UnboundedSender<AsyncTask>> {
+        if let RuntimeState::Running = self.state {
+            Ok(self.sender.clone())
+        } else {
+            Err(AsyncError::UnitializedRuntimeError)
+        }
     }
 
-    pub async fn coordinator(mut rx: UnboundedReceiver<AsyncTask>) -> AsyncResult<()> {
-        // let mut tasks = vec![];
+    pub async fn coordinator(
+        mut rx: UnboundedReceiver<AsyncTask>,
+        glv: Arc<Mutex<VecDeque<String>>>,
+    ) {
+        let mut tasks = vec![];
         while let Some(msg) = rx.recv().await {
+            let glv_clone = glv.clone();
             match msg {
-                AsyncTask::StreamIOToFile(stderr, stdout, ferr, fout, pid) => {}
-                AsyncTask::KillThread => {}
+                AsyncTask::StreamIOToFile(stderr, stdout, ferr, fout, pid) => {
+                    let handle = tokio::spawn(async move {
+                        Self::stream_to_file(stderr, stdout, ferr, fout, glv_clone, pid).await
+                    });
+                    tasks.push((pid, handle));
+                }
+                AsyncTask::KillThread(pid) => {
+                    //get the task, handle pair, collect it and then remove it
+                    if let Some(pos) = tasks.iter().position(|&(ipid, _)| ipid == pid) {
+                        let handle = tasks.remove(pos).1;
+                        Self::kill_async(handle);
+                    }
+                }
             }
         }
-        Ok(())
+    }
+
+    pub fn kill_async(handle: JoinHandle<AsyncResult<()>>) {
+        handle.abort();
     }
 
     pub async fn stream_to_file(
@@ -112,7 +150,7 @@ impl GlobalAysncIOManager {
 
         while let Some(line) = out_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"[{}:{}:{}:{}:{}:{}] {}\n", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.millisecond(), line};
+            let complete = format! {"ErrStream: [{}:{}:{}:{}:{}:{}] {}\n", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.millisecond(), line};
             fout.write(complete.as_bytes())?;
             fout.flush()?;
             let curr = global_log_vector.clone();
@@ -128,5 +166,9 @@ impl GlobalAysncIOManager {
         }
 
         Ok(())
+    }
+
+    pub fn drop_runtime(self) {
+        self.rt.shutdown_timeout(Duration::from_secs(1));
     }
 }
