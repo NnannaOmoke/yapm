@@ -157,23 +157,6 @@ impl ProcessLogger {
         self.stderr_src = Some(stderr);
         self.stdout_src = Some(stdout);
     }
-
-    //the next thing to do is to handle the streaming;
-    //we will firstly, maybe define a task struct to handle this?
-    //we need to find a way to tell the parked thread how to handle the incomign tasks
-    //;everything should be handled async-ly by the thread. We construct an instance of a threadtask and use mspc to send it there
-    fn create_and_send_stream_task(&mut self) -> LogOpResult<()> {
-        let (err, out) =
-            if let (Some(err), Some(out)) = (self.stderr_src.take(), self.stdout_src.take()) {
-                (err, out)
-            } else {
-                return Err(LoggingError::TaskError(TaskError::ProcessStateUnitialized));
-            };
-        let err_clone = self.stderr.try_clone()?;
-        let out_clone = self.stdout.try_clone()?;
-        let task = AsyncTask::StreamIOToFile(err, out, err_clone, out_clone);
-        Ok(())
-    }
 }
 
 #[cfg(test)]

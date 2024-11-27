@@ -51,7 +51,6 @@ impl ChildWrapper {
     fn kill(&mut self) -> TaskResult<()> {
         if let Self::Started(handle) = self {
             handle.kill()?;
-            //we'll have to use ASYNC for this or massive multithreading
             handle.wait()?;
         } else {
             return Err(TaskError::ProcessStateUnitialized);
@@ -189,6 +188,11 @@ impl Task {
     //by fire, by force
     fn kill(&mut self) -> TaskResult<()> {
         if let Err(e) = self.inner.kill() {
+            #[cfg(debug_assertions)]
+            match e {
+                TaskError::ProcessStateUnitialized => return Ok(()),
+                _ => {}
+            };
             let pid = self.inner.getpid().unwrap();
             resolve_os_declarations!(linux::kill_process_sigkill(pid)?, None);
         }
