@@ -168,7 +168,68 @@ impl GlobalAysncIOManager {
         Ok(())
     }
 
-    pub fn drop_runtime(self) {
+    pub fn drop_runtime(mut self) {
+        *(&mut self.state) = RuntimeState::Unavailable;
         self.rt.shutdown_timeout(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+
+    use std::process::ChildStderr;
+    use std::process::ChildStdout;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    use std::rc::Rc;
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use std::thread::sleep;
+    use std::thread::spawn;
+    #[test]
+    fn init_async_runtime() {
+        let (tx, rx) = channel();
+        let mut cmd = Command::new("examples/test_one.sh")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("The process could not be spawned");
+        let pid = cmd.id() as i32;
+        let stderr = cmd.stderr.take().unwrap();
+        let stdout = cmd.stdout.take().unwrap();
+        let glv = Arc::new(Mutex::new(VecDeque::new()));
+        let glv_clone = glv.clone();
+        let fout = File::create("examples/out.txt").unwrap();
+        let ferr = File::options()
+            .create(true)
+            .write(true)
+            .open("examples/err.txt")
+            .unwrap();
+        let handle = spawn(move || {
+            let global_manager =
+                GlobalAysncIOManager::new(glv_clone).expect("The GAM could not be initialized");
+            let tx_s = global_manager
+                .give_sender()
+                .expect("The GAM had still not started up");
+            tx.send(tx_s).unwrap();
+        });
+        let tx_s = rx
+            .recv()
+            .expect("Well something happened that we didn't expect");
+        let task_m = AsyncTask::StreamIOToFile(stderr, stdout, ferr, fout, pid);
+        if let Err(e) = tx_s.send(task_m) {
+            panic!("{}", e);
+        };
+        //we sleep this thread, and then see what's up thread so we have to do all of that on another thread
+        sleep(Duration::new(2, 0));
+        assert!(glv.lock().unwrap().len() == 1);
+        sleep(Duration::new(5, 0));
+        assert!(glv.lock().unwrap().len() == 2);
     }
 }
