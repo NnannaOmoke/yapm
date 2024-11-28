@@ -17,6 +17,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use time::error::IndeterminateOffset;
+use time::util::local_offset::Soundness;
 use time::OffsetDateTime;
 
 use tokio::io::AsyncBufReadExt;
@@ -34,6 +35,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use tokio::task::JoinHandle;
 
+#[derive(Debug)]
 pub enum AsyncTask {
     StreamIOToFile(ChildStderr, ChildStdout, File, File, i32),
     KillThread(i32),
@@ -65,18 +67,34 @@ pub struct GlobalAysncIOManager {
 }
 
 impl GlobalAysncIOManager {
-    pub fn new(glv: Arc<Mutex<VecDeque<String>>>) -> AsyncResult<Self> {
+    pub fn new() -> AsyncResult<(Self, UnboundedReceiver<AsyncTask>)> {
+        unsafe {
+            time::util::local_offset::set_soundness(Soundness::Unsound);
+        }
         let (tx, rx) = unbounded_channel();
-        let rt = Builder::new_current_thread()
+        let rt = Builder::new_multi_thread()
             .worker_threads(4)
+            .enable_all()
             .thread_name("YAPM async handler")
             .build()?;
-        rt.spawn(Self::coordinator(rx, glv));
-        Ok(Self {
-            sender: tx,
-            rt,
-            state: RuntimeState::Running,
-        })
+        Ok((
+            Self {
+                sender: tx,
+                rt,
+                state: RuntimeState::Unavailable,
+            },
+            rx,
+        ))
+    }
+
+    //we want to start the runtime state here AFTER setting the values for the GlobalAsyncIOManager
+    pub fn start_runtime(
+        &mut self,
+        rx: UnboundedReceiver<AsyncTask>,
+        glv: Arc<Mutex<VecDeque<String>>>,
+    ) {
+        self.state = RuntimeState::Running;
+        let handle = self.rt.spawn(Self::coordinator(rx, glv));
     }
 
     pub fn give_sender(&self) -> AsyncResult<UnboundedSender<AsyncTask>> {
@@ -133,7 +151,7 @@ impl GlobalAysncIOManager {
         while let Some(line) = err_reader.next_line().await? {
             //we need to get the time crate so that we can format this properly
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"[{}:{}:{}:{}:{}:{}] {}\n", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.millisecond(), line};
+            let complete = format! {"ErrStream: [{}:{}:{}, {}:{}:{}] {}\n", time.millisecond(), time.minute(), time.hour(), time.day(), time.month(), time.year(), line};
             ferr.write(complete.as_bytes())?;
             ferr.flush()?;
             let curr = global_log_vector.clone();
@@ -143,14 +161,14 @@ impl GlobalAysncIOManager {
                     lk.pop_front();
                     lk.push_back(complete);
                 } else {
-                    lk.push_back(complete)
+                    lk.push_back(complete);
                 }
             }
         }
 
         while let Some(line) = out_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"ErrStream: [{}:{}:{}:{}:{}:{}] {}\n", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.millisecond(), line};
+            let complete = format! {"OutStream: [{}:{}:{}, {}:{}:{}] {}\n", time.millisecond(), time.minute(), time.hour(), time.day(), time.month(), time.year(), line};
             fout.write(complete.as_bytes())?;
             fout.flush()?;
             let curr = global_log_vector.clone();
@@ -180,21 +198,15 @@ mod tests {
 
     use std::fs::File;
 
-    use std::process::ChildStderr;
-    use std::process::ChildStdout;
     use std::process::Command;
     use std::process::Stdio;
 
-    use std::rc::Rc;
-    use std::sync::mpsc::channel;
     use std::sync::Arc;
     use std::sync::Mutex;
 
     use std::thread::sleep;
-    use std::thread::spawn;
     #[test]
     fn init_async_runtime() {
-        let (tx, rx) = channel();
         let mut cmd = Command::new("examples/test_one.sh")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -211,22 +223,16 @@ mod tests {
             .write(true)
             .open("examples/err.txt")
             .unwrap();
-        let handle = spawn(move || {
-            let global_manager =
-                GlobalAysncIOManager::new(glv_clone).expect("The GAM could not be initialized");
-            let tx_s = global_manager
-                .give_sender()
-                .expect("The GAM had still not started up");
-            tx.send(tx_s).unwrap();
-        });
-        let tx_s = rx
-            .recv()
-            .expect("Well something happened that we didn't expect");
+        let (mut global_manager, rx) =
+            GlobalAysncIOManager::new().expect("The GAM could not be initialized");
+        global_manager.start_runtime(rx, glv_clone);
+        let tx_s = global_manager
+            .give_sender()
+            .expect("The GAM had still not started up");
         let task_m = AsyncTask::StreamIOToFile(stderr, stdout, ferr, fout, pid);
         if let Err(e) = tx_s.send(task_m) {
             panic!("{}", e);
         };
-        //we sleep this thread, and then see what's up thread so we have to do all of that on another thread
         sleep(Duration::new(2, 0));
         assert!(glv.lock().unwrap().len() == 1);
         sleep(Duration::new(5, 0));
