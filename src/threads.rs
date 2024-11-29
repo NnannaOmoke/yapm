@@ -60,13 +60,13 @@ enum RuntimeState {
 
 type AsyncResult<T> = Result<T, AsyncError>;
 
-pub struct GlobalAysncIOManager {
+pub struct GlobalAsyncIOManager {
     rt: Runtime,
     sender: UnboundedSender<AsyncTask>,
     state: RuntimeState,
 }
 
-impl GlobalAysncIOManager {
+impl GlobalAsyncIOManager {
     pub fn new() -> AsyncResult<(Self, UnboundedReceiver<AsyncTask>)> {
         unsafe {
             time::util::local_offset::set_soundness(Soundness::Unsound);
@@ -109,7 +109,7 @@ impl GlobalAysncIOManager {
         mut rx: UnboundedReceiver<AsyncTask>,
         glv: Arc<Mutex<VecDeque<String>>>,
     ) {
-        let mut tasks = vec![];
+        let mut tasks = vec![]; //can we not make this global?, nah, this isn't a self.fn (double_muts?)
         while let Some(msg) = rx.recv().await {
             let glv_clone = glv.clone();
             match msg {
@@ -149,9 +149,16 @@ impl GlobalAysncIOManager {
         let mut out_reader = BufReader::new(stdout).lines();
 
         while let Some(line) = err_reader.next_line().await? {
-            //we need to get the time crate so that we can format this properly
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"ErrStream: [{}:{}:{}, {}:{}:{}] {}\n", time.millisecond(), time.minute(), time.hour(), time.day(), time.month(), time.year(), line};
+            let complete = format! {"ErrStream: [{}:{}:{}, {}:{}:{}] {}\n",
+                time.hour(),
+                time.minute(),
+                time.second(),
+                time.day(),
+                time.month(),
+                time.year(),
+                line
+            };
             ferr.write(complete.as_bytes())?;
             ferr.flush()?;
             let curr = global_log_vector.clone();
@@ -168,7 +175,15 @@ impl GlobalAysncIOManager {
 
         while let Some(line) = out_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"OutStream: [{}:{}:{}, {}:{}:{}] {}\n", time.millisecond(), time.minute(), time.hour(), time.day(), time.month(), time.year(), line};
+            let complete = format! {"OutStream: [{}:{}:{}, {}:{}:{}] {}\n",
+                time.hour(),
+                time.minute(),
+                time.second(),
+                time.day(),
+                time.month(),
+                time.year(),
+                line
+            };
             fout.write(complete.as_bytes())?;
             fout.flush()?;
             let curr = global_log_vector.clone();
@@ -188,6 +203,7 @@ impl GlobalAysncIOManager {
 
     pub fn drop_runtime(mut self) {
         *(&mut self.state) = RuntimeState::Unavailable;
+        //should block for about a second
         self.rt.shutdown_timeout(Duration::from_secs(1));
     }
 }
@@ -205,6 +221,7 @@ mod tests {
     use std::sync::Mutex;
 
     use std::thread::sleep;
+
     #[test]
     fn init_async_runtime() {
         let mut cmd = Command::new("examples/test_one.sh")
@@ -224,7 +241,7 @@ mod tests {
             .open("examples/err.txt")
             .unwrap();
         let (mut global_manager, rx) =
-            GlobalAysncIOManager::new().expect("The GAM could not be initialized");
+            GlobalAsyncIOManager::new().expect("The GAM could not be initialized");
         global_manager.start_runtime(rx, glv_clone);
         let tx_s = global_manager
             .give_sender()
@@ -237,5 +254,60 @@ mod tests {
         assert!(glv.lock().unwrap().len() == 1);
         sleep(Duration::new(5, 0));
         assert!(glv.lock().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn test_async_io_task_kill() {
+        let mut cmds = vec![];
+        for index in 0..=3 {
+            let name = format! {"{}_sleep_command", index};
+            let curr = Command::new("examples/test_one.sh")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("The process could not be spawned");
+            let ferr = File::create(format! {"examples/ferr_{}.txt", index}).unwrap();
+            let fout = File::create(format! {"examples/fout_{}.txt", index}).unwrap();
+            let id = curr.id();
+            cmds.push((name, curr, ferr, fout, id as i32))
+        }
+        //we have 4 spawned tasks
+        //we'll start them, and then kill one of them before its able to write the last string to it's stderr
+        //we'll then assert that the glv has 7 contents in it
+        let glv = Arc::new(Mutex::new(VecDeque::new()));
+        let (mut gam, rx) = GlobalAsyncIOManager::new().expect("The gam could not be started");
+        gam.start_runtime(rx, glv.clone());
+        let third_tup_id = cmds[3].4;
+        for tup in cmds {
+            let mut cmd = tup.1;
+            let task = AsyncTask::StreamIOToFile(
+                cmd.stderr.take().unwrap(),
+                cmd.stdout.take().unwrap(),
+                tup.2,
+                tup.3,
+                tup.4,
+            );
+            let tx_s = gam.give_sender().unwrap();
+            tx_s.send(task).unwrap();
+        }
+        //now, we'll sleep for one second, and assert that the glv is of size 4
+        sleep(Duration::new(1, 0));
+        assert_eq!(glv.lock().unwrap().len(), 4);
+        //now, get another sender, and try to kill one of the running tasks
+        let tx_s = gam.give_sender().unwrap();
+        let task = AsyncTask::KillThread(third_tup_id);
+        tx_s.send(task).unwrap();
+        //sleep again?
+        sleep(Duration::new(5, 0));
+        //everything should be done, now
+        assert_eq!(glv.lock().unwrap().len(), 7); //one has been killed;
+        gam.drop_runtime();
+    }
+
+    #[should_panic]
+    #[test]
+    fn test_async_order() {
+        let (gam, rx) = GlobalAsyncIOManager::new().unwrap();
+        let tx_s = gam.give_sender().unwrap(); //should panic, we've not yet started the runtime
     }
 }

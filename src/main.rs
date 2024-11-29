@@ -7,7 +7,8 @@
 //Solution: This is something we have to test and work on now, probably by finding non-blocking ways to collect process input
 //TODO: probably use async for the more I/O intensive read-writes for logging
 //Solution: get the crates: aysnc-fs, pollster, futures, but this will all be done in the logging.rs and threads.rs
-//
+//TODO: we now want to look at ways to design permissions for processes
+//this would involve re-writing some functions from the Nix crate
 
 mod core;
 mod threads;

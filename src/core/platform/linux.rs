@@ -1,6 +1,3 @@
-use nix::sys::prctl;
-use nix::sys::ptrace;
-
 use nix::errno::Errno;
 
 use nix::unistd::Pid;
