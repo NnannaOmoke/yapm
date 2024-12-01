@@ -150,7 +150,8 @@ impl GlobalAsyncIOManager {
 
         while let Some(line) = err_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"ErrStream: [{}:{}:{}, {}:{}:{}] {}\n",
+            let complete = format! {
+                "ErrStream: [{}:{}:{}, {}:{}:{}] {}\n",
                 time.hour(),
                 time.minute(),
                 time.second(),
@@ -175,7 +176,8 @@ impl GlobalAsyncIOManager {
 
         while let Some(line) = out_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
-            let complete = format! {"OutStream: [{}:{}:{}, {}:{}:{}] {}\n",
+            let complete = format! {
+                "OutStream: [{}:{}:{}, {}:{}:{}] {}\n",
                 time.hour(),
                 time.minute(),
                 time.second(),

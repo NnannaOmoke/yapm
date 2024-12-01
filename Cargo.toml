@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-nix = {version = "0.29.0", features = ["acct", "process", "signal", "ptrace"]}
+cgroups-rs = "0.3.4"
+nix = {version = "0.29.0", features = ["acct", "process", "signal", "ptrace", "resource"]}
 thiserror = "2.0.3"
 time = {version = "0.3.36", features = ["local-offset"]}
 tokio = {version = "1.41.1", features = ["sync", "rt", "io-util", "process", "rt-multi-thread"]}
