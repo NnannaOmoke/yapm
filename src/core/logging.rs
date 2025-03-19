@@ -13,7 +13,6 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 use crate::core::task::TaskError;
-use crate::threads::AsyncTask;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_LOG_DIR_LOCATION: &'static str = "/usr/bin/yapm/logs";

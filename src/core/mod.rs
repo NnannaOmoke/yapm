@@ -1,4 +1,4 @@
 mod device;
 mod logging;
-mod platform;
+pub mod platform;
 mod task;

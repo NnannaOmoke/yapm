@@ -1,10 +1,28 @@
-use cgroups_rs::Cgroup;
-use cgroups_rs::CpuResources;
+use std::ffi::CString;
+
+use std::fs::File;
+
+use std::io::Read;
+use std::io::Result as IOResult;
+
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+
+use std::task::Poll;
+
 use cgroups_rs::Resources;
+
+use futures::ready;
 
 use nix::errno::Errno;
 
-use nix::unistd::Pid;
+use nix::libc::STDERR_FILENO;
+use nix::libc::STDOUT_FILENO;
+
+use nix::fcntl::fcntl;
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
 
 use nix::sys::resource::setrlimit;
 use nix::sys::resource::Resource;
@@ -15,9 +33,102 @@ use nix::sys::signal::SIGCONT;
 use nix::sys::signal::SIGKILL;
 use nix::sys::signal::SIGSTOP;
 
+use nix::unistd::dup2;
+use nix::unistd::execv;
+use nix::unistd::fork;
+use nix::unistd::pipe;
+use nix::unistd::ForkResult;
+use nix::unistd::Pid;
+
+use tokio::io::unix::AsyncFd;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
+use tokio::io::BufReader;
+use tokio::io::Lines;
+
 use thiserror::Error;
 
 type LinuxOpResult<T> = Result<T, LinuxErrorManager>;
+
+#[derive(Debug)]
+pub struct ManagedStream {
+    inner: AsyncFd<OwnedFd>,
+}
+
+impl ManagedStream {
+    fn new(fd: OwnedFd) -> LinuxOpResult<Self> {
+        let cflags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL)?;
+        let cflags = OFlag::from_bits_truncate(cflags);
+        let nflag = cflags | OFlag::O_NONBLOCK;
+        fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(nflag))?;
+        let async_fd = AsyncFd::new(fd).expect("
+            Asynchronous file descriptor could not be created from the process' stderr/stdout         
+        ");
+        Ok(Self { inner: async_fd })
+    }
+
+    pub async fn read(&self, out: &mut [u8]) -> IOResult<usize> {
+        loop {
+            let mut g = self.inner.readable().await?;
+            match g.try_io(|inner| {
+                let mut f = unsafe { File::from_raw_fd(self.inner.as_raw_fd()) };
+                f.read(out)
+            }) {
+                Ok(result) => return result,
+                Err(_) => continue,
+            };
+        }
+    }
+}
+
+impl AsyncRead for ManagedStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            let mut g = ready!(self.inner.poll_read_ready(cx))?;
+            let unfilled = buf.initialize_unfilled();
+            match g.try_io(|inner| {
+                let mut f = unsafe { File::from_raw_fd(self.inner.as_raw_fd()) };
+                f.read(unfilled)
+            }) {
+                Ok(Ok(len)) => {
+                    buf.advance(len);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(err)) => return Poll::Ready(Err(err)),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+//we just have this for debug purposes right now
+pub struct ManagedLinuxProcess {
+    pid: Pid,
+    stderr: Option<ManagedStream>,
+    stdout: Option<ManagedStream>,
+}
+
+impl ManagedLinuxProcess {
+    fn sigkill(self) -> LinuxOpResult<()> {
+        kill_process_sigkill(self.pid.as_raw())?;
+        Ok(())
+    }
+
+    fn readers(
+        &mut self,
+    ) -> (
+        Lines<BufReader<ManagedStream>>,
+        Lines<BufReader<ManagedStream>>,
+    ) {
+        let bout = BufReader::new(self.stdout.take().unwrap()).lines();
+        let berr = BufReader::new(self.stderr.take().unwrap()).lines();
+        return (bout, berr);
+    }
+}
 
 #[derive(Default)]
 pub enum CPUPriority {
@@ -113,4 +224,53 @@ pub fn set_process_mem_max_cgroups(
         _ => {}
     };
     Ok(())
+}
+
+pub unsafe fn create_child_exec_context(
+    target: String,
+    args: &[String],
+) -> LinuxOpResult<ManagedLinuxProcess> {
+    let (stderr_read_fd, stderr_write_fd) = pipe()?;
+    let (stdout_read_fd, stdout_write_fd) = pipe()?;
+    match fork()? {
+        ForkResult::Parent { child } => {
+            let merr = ManagedStream::new(stderr_read_fd)?;
+            let mout = ManagedStream::new(stdout_read_fd)?;
+            let value = ManagedLinuxProcess {
+                pid: child,
+                stderr: Some(merr),
+                stdout: Some(mout),
+            };
+            return Ok(value);
+        }
+        ForkResult::Child => {
+            //we can put in the security measures here, for now, we want to set up
+            //stderr and stdout
+            //some processing first
+            let target = CString::from_vec_unchecked(target.into_bytes());
+            let args = args
+                .iter()
+                .map(|f| CString::from_vec_unchecked(f.clone().into_bytes()))
+                .collect::<Vec<_>>();
+
+            dup2(stderr_write_fd.as_raw_fd(), STDERR_FILENO)?;
+            dup2(stdout_write_fd.as_raw_fd(), STDOUT_FILENO)?;
+
+            execv(target.as_c_str(), &args)?;
+            unreachable!("Like, obviously, this isn't supposed to happen, lol");
+        }
+    };
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fork() {
+        let v = unsafe {
+            create_child_exec_context(String::from("examples/test_one.sh"), &vec![])
+                .expect("creating child process failed")
+        };
+    }
 }

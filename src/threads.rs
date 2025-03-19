@@ -1,3 +1,5 @@
+use crate::core::platform::linux::ManagedStream;
+
 use std::collections::VecDeque;
 
 use std::fmt::Debug;
@@ -17,11 +19,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 use time::error::IndeterminateOffset;
-use time::util::local_offset::Soundness;
+// use time::util::local_offset::Soundness;
 use time::OffsetDateTime;
 
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::io::Lines;
 
 use tokio::process::ChildStderr as TokioStderr;
 use tokio::process::ChildStdout as TokioStdout;
@@ -68,9 +71,6 @@ pub struct GlobalAsyncIOManager {
 
 impl GlobalAsyncIOManager {
     pub fn new() -> AsyncResult<(Self, UnboundedReceiver<AsyncTask>)> {
-        unsafe {
-            time::util::local_offset::set_soundness(Soundness::Unsound);
-        }
         let (tx, rx) = unbounded_channel();
         let rt = Builder::new_multi_thread()
             .worker_threads(4)
@@ -114,16 +114,23 @@ impl GlobalAsyncIOManager {
             let glv_clone = glv.clone();
             match msg {
                 AsyncTask::StreamIOToFile(stderr, stdout, ferr, fout, pid) => {
-                    let handle = tokio::spawn(async move {
-                        Self::stream_to_file(stderr, stdout, ferr, fout, glv_clone, pid).await
+                    let another = glv.clone();
+                    let handle_err = tokio::spawn(async move {
+                        Self::stream_stderr(stderr, ferr, glv_clone, pid).await
                     });
-                    tasks.push((pid, handle));
+                    let handle_out = tokio::spawn(async move {
+                        Self::stream_stdout(stdout, fout, another, pid).await
+                    });
+                    tasks.push((pid, handle_err, handle_out));
                 }
                 AsyncTask::KillThread(pid) => {
                     //get the task, handle pair, collect it and then remove it
-                    if let Some(pos) = tasks.iter().position(|&(ipid, _)| ipid == pid) {
-                        let handle = tasks.remove(pos).1;
-                        Self::kill_async(handle);
+                    if let Some(pos) = tasks.iter().position(|&(ipid, _, _)| ipid == pid) {
+                        let handle = tasks.remove(pos);
+                        let err_handle = handle.1;
+                        let out_handle = handle.2;
+                        Self::kill_async(err_handle);
+                        Self::kill_async(out_handle);
                     }
                 }
             }
@@ -134,19 +141,14 @@ impl GlobalAsyncIOManager {
         handle.abort();
     }
 
-    pub async fn stream_to_file(
+    pub async fn stream_stderr(
         stderr: ChildStderr,
-        stdout: ChildStdout,
         mut ferr: File,
-        mut fout: File,
-        global_log_vector: Arc<Mutex<VecDeque<String>>>,
+        glv: Arc<Mutex<VecDeque<String>>>,
         pid: i32,
     ) -> AsyncResult<()> {
         let stderr = TokioStderr::from_std(stderr)?;
-        let stdout = TokioStdout::from_std(stdout)?;
-
         let mut err_reader = BufReader::new(stderr).lines();
-        let mut out_reader = BufReader::new(stdout).lines();
 
         while let Some(line) = err_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
@@ -162,7 +164,7 @@ impl GlobalAsyncIOManager {
             };
             ferr.write(complete.as_bytes())?;
             ferr.flush()?;
-            let curr = global_log_vector.clone();
+            let curr = glv.clone();
             let lock = curr.lock();
             if let Ok(mut lk) = lock {
                 if lk.len() >= 10 {
@@ -173,6 +175,51 @@ impl GlobalAsyncIOManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub async fn t_stream_stderr(
+        mut stderr: Lines<BufReader<ManagedStream>>,
+        mut ferr: File,
+        glv: Arc<Mutex<VecDeque<String>>>,
+        pid: i32,
+    ) -> AsyncResult<()> {
+        while let Some(line) = stderr.next_line().await? {
+            let time = OffsetDateTime::now_local()?;
+            let complete = format! {
+                "ErrStream: [{}:{}:{}, {}:{}:{}] {}\n",
+                time.hour(),
+                time.minute(),
+                time.second(),
+                time.day(),
+                time.month(),
+                time.year(),
+                line
+            };
+            ferr.write(complete.as_bytes())?;
+            ferr.flush()?;
+            let curr = glv.clone();
+            let lock = curr.lock();
+            if let Ok(mut lk) = lock {
+                if lk.len() >= 10 {
+                    lk.pop_front();
+                    lk.push_back(complete);
+                } else {
+                    lk.push_back(complete);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn stream_stdout(
+        stdout: ChildStdout,
+        mut fout: File,
+        glv: Arc<Mutex<VecDeque<String>>>,
+        pid: i32,
+    ) -> AsyncResult<()> {
+        let stdout = TokioStdout::from_std(stdout)?;
+        let mut out_reader = BufReader::new(stdout).lines();
 
         while let Some(line) = out_reader.next_line().await? {
             let time = OffsetDateTime::now_local()?;
@@ -188,7 +235,7 @@ impl GlobalAsyncIOManager {
             };
             fout.write(complete.as_bytes())?;
             fout.flush()?;
-            let curr = global_log_vector.clone();
+            let curr = glv.clone();
             let lock = curr.lock();
             if let Ok(mut lk) = lock {
                 if lk.len() >= 10 {
