@@ -1,0 +1,2 @@
+OutStream: [18:35:29, 20:March:2025] hello, i'm running
+OutStream: [18:35:34, 20:March:2025] hello, i'm dying

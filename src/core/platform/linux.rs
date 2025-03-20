@@ -1,12 +1,8 @@
 use std::ffi::CString;
 
-use std::fs::File;
-
-use std::io::Read;
 use std::io::Result as IOResult;
 
 use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use std::task::Poll;
@@ -37,6 +33,7 @@ use nix::unistd::dup2;
 use nix::unistd::execv;
 use nix::unistd::fork;
 use nix::unistd::pipe;
+use nix::unistd::read as nix_read;
 use nix::unistd::ForkResult;
 use nix::unistd::Pid;
 
@@ -48,6 +45,7 @@ use tokio::io::Lines;
 
 use thiserror::Error;
 
+pub type LinuxAsyncLines = Lines<BufReader<ManagedStream>>;
 type LinuxOpResult<T> = Result<T, LinuxErrorManager>;
 
 #[derive(Debug)]
@@ -71,8 +69,8 @@ impl ManagedStream {
         loop {
             let mut g = self.inner.readable().await?;
             match g.try_io(|inner| {
-                let mut f = unsafe { File::from_raw_fd(self.inner.as_raw_fd()) };
-                f.read(out)
+                let fd = self.inner.as_raw_fd();
+                nix_read(fd, out).map_err(|e| std::io::Error::from_raw_os_error(e as i32))
             }) {
                 Ok(result) => return result,
                 Err(_) => continue,
@@ -91,8 +89,8 @@ impl AsyncRead for ManagedStream {
             let mut g = ready!(self.inner.poll_read_ready(cx))?;
             let unfilled = buf.initialize_unfilled();
             match g.try_io(|inner| {
-                let mut f = unsafe { File::from_raw_fd(self.inner.as_raw_fd()) };
-                f.read(unfilled)
+                let fd = self.inner.as_raw_fd();
+                nix_read(fd, unfilled).map_err(|e| std::io::Error::from_raw_os_error(e as i32))
             }) {
                 Ok(Ok(len)) => {
                     buf.advance(len);
@@ -113,12 +111,12 @@ pub struct ManagedLinuxProcess {
 }
 
 impl ManagedLinuxProcess {
-    fn sigkill(self) -> LinuxOpResult<()> {
+    pub fn sigkill(self) -> LinuxOpResult<()> {
         kill_process_sigkill(self.pid.as_raw())?;
         Ok(())
     }
 
-    fn readers(
+    pub fn readers(
         &mut self,
     ) -> (
         Lines<BufReader<ManagedStream>>,
@@ -127,6 +125,10 @@ impl ManagedLinuxProcess {
         let bout = BufReader::new(self.stdout.take().unwrap()).lines();
         let berr = BufReader::new(self.stderr.take().unwrap()).lines();
         return (bout, berr);
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.pid.as_raw()
     }
 }
 
@@ -169,6 +171,42 @@ impl From<Errno> for LinuxErrorManager {
             err_code => LinuxErrorManager::UnexpectedError(err_code),
         }
     }
+}
+
+pub unsafe fn create_child_exec_context(
+    target: String,
+    args: &[String],
+) -> LinuxOpResult<ManagedLinuxProcess> {
+    let (stderr_read_fd, stderr_write_fd) = pipe()?;
+    let (stdout_read_fd, stdout_write_fd) = pipe()?;
+    match fork()? {
+        ForkResult::Parent { child } => {
+            let merr = ManagedStream::new(stderr_read_fd)?;
+            let mout = ManagedStream::new(stdout_read_fd)?;
+            let value = ManagedLinuxProcess {
+                pid: child,
+                stderr: Some(merr),
+                stdout: Some(mout),
+            };
+            return Ok(value);
+        }
+        ForkResult::Child => {
+            //we can put in the security measures here, for now, we want to set up
+            //stderr and stdout
+            //some processing first
+            let target = CString::from_vec_unchecked(target.into_bytes());
+            let args = args
+                .iter()
+                .map(|f| CString::from_vec_unchecked(f.clone().into_bytes()))
+                .collect::<Vec<_>>();
+
+            dup2(stderr_write_fd.as_raw_fd(), STDERR_FILENO)?;
+            dup2(stdout_write_fd.as_raw_fd(), STDOUT_FILENO)?;
+
+            execv(target.as_c_str(), &args)?;
+            unreachable!("Like, obviously, this isn't supposed to happen, lol");
+        }
+    };
 }
 
 pub fn kill_process_sigkill(id: i32) -> LinuxOpResult<()> {
@@ -224,42 +262,6 @@ pub fn set_process_mem_max_cgroups(
         _ => {}
     };
     Ok(())
-}
-
-pub unsafe fn create_child_exec_context(
-    target: String,
-    args: &[String],
-) -> LinuxOpResult<ManagedLinuxProcess> {
-    let (stderr_read_fd, stderr_write_fd) = pipe()?;
-    let (stdout_read_fd, stdout_write_fd) = pipe()?;
-    match fork()? {
-        ForkResult::Parent { child } => {
-            let merr = ManagedStream::new(stderr_read_fd)?;
-            let mout = ManagedStream::new(stdout_read_fd)?;
-            let value = ManagedLinuxProcess {
-                pid: child,
-                stderr: Some(merr),
-                stdout: Some(mout),
-            };
-            return Ok(value);
-        }
-        ForkResult::Child => {
-            //we can put in the security measures here, for now, we want to set up
-            //stderr and stdout
-            //some processing first
-            let target = CString::from_vec_unchecked(target.into_bytes());
-            let args = args
-                .iter()
-                .map(|f| CString::from_vec_unchecked(f.clone().into_bytes()))
-                .collect::<Vec<_>>();
-
-            dup2(stderr_write_fd.as_raw_fd(), STDERR_FILENO)?;
-            dup2(stdout_write_fd.as_raw_fd(), STDOUT_FILENO)?;
-
-            execv(target.as_c_str(), &args)?;
-            unreachable!("Like, obviously, this isn't supposed to happen, lol");
-        }
-    };
 }
 
 #[cfg(test)]

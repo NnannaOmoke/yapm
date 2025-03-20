@@ -1,3 +1,4 @@
+use crate::core::platform::linux::LinuxAsyncLines;
 use crate::core::platform::linux::ManagedStream;
 
 use std::collections::VecDeque;
@@ -7,9 +8,6 @@ use std::fmt::Debug;
 use std::fs::File;
 
 use std::io::Write;
-
-use std::process::ChildStderr;
-use std::process::ChildStdout;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,12 +20,8 @@ use time::error::IndeterminateOffset;
 // use time::util::local_offset::Soundness;
 use time::OffsetDateTime;
 
-use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::io::Lines;
-
-use tokio::process::ChildStderr as TokioStderr;
-use tokio::process::ChildStdout as TokioStdout;
 
 use tokio::runtime::Builder;
 use tokio::runtime::Runtime;
@@ -40,7 +34,7 @@ use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub enum AsyncTask {
-    StreamIOToFile(ChildStderr, ChildStdout, File, File, i32),
+    StreamIOToFile(LinuxAsyncLines, LinuxAsyncLines, File, File, i32),
     KillThread(i32),
 }
 
@@ -142,43 +136,6 @@ impl GlobalAsyncIOManager {
     }
 
     pub async fn stream_stderr(
-        stderr: ChildStderr,
-        mut ferr: File,
-        glv: Arc<Mutex<VecDeque<String>>>,
-        pid: i32,
-    ) -> AsyncResult<()> {
-        let stderr = TokioStderr::from_std(stderr)?;
-        let mut err_reader = BufReader::new(stderr).lines();
-
-        while let Some(line) = err_reader.next_line().await? {
-            let time = OffsetDateTime::now_local()?;
-            let complete = format! {
-                "ErrStream: [{}:{}:{}, {}:{}:{}] {}\n",
-                time.hour(),
-                time.minute(),
-                time.second(),
-                time.day(),
-                time.month(),
-                time.year(),
-                line
-            };
-            ferr.write(complete.as_bytes())?;
-            ferr.flush()?;
-            let curr = glv.clone();
-            let lock = curr.lock();
-            if let Ok(mut lk) = lock {
-                if lk.len() >= 10 {
-                    lk.pop_front();
-                    lk.push_back(complete);
-                } else {
-                    lk.push_back(complete);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn t_stream_stderr(
         mut stderr: Lines<BufReader<ManagedStream>>,
         mut ferr: File,
         glv: Arc<Mutex<VecDeque<String>>>,
@@ -213,15 +170,12 @@ impl GlobalAsyncIOManager {
     }
 
     pub async fn stream_stdout(
-        stdout: ChildStdout,
-        mut fout: File,
+        mut stdout: Lines<BufReader<ManagedStream>>,
+        mut ferr: File,
         glv: Arc<Mutex<VecDeque<String>>>,
         pid: i32,
     ) -> AsyncResult<()> {
-        let stdout = TokioStdout::from_std(stdout)?;
-        let mut out_reader = BufReader::new(stdout).lines();
-
-        while let Some(line) = out_reader.next_line().await? {
+        while let Some(line) = stdout.next_line().await? {
             let time = OffsetDateTime::now_local()?;
             let complete = format! {
                 "OutStream: [{}:{}:{}, {}:{}:{}] {}\n",
@@ -233,8 +187,8 @@ impl GlobalAsyncIOManager {
                 time.year(),
                 line
             };
-            fout.write(complete.as_bytes())?;
-            fout.flush()?;
+            ferr.write(complete.as_bytes())?;
+            ferr.flush()?;
             let curr = glv.clone();
             let lock = curr.lock();
             if let Ok(mut lk) = lock {
@@ -242,11 +196,10 @@ impl GlobalAsyncIOManager {
                     lk.pop_front();
                     lk.push_back(complete);
                 } else {
-                    lk.push_back(complete)
+                    lk.push_back(complete);
                 }
             }
         }
-
         Ok(())
     }
 
@@ -259,12 +212,11 @@ impl GlobalAsyncIOManager {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::linux::create_child_exec_context;
+
     use super::*;
 
     use std::fs::File;
-
-    use std::process::Command;
-    use std::process::Stdio;
 
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -273,14 +225,6 @@ mod tests {
 
     #[test]
     fn init_async_runtime() {
-        let mut cmd = Command::new("examples/test_one.sh")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("The process could not be spawned");
-        let pid = cmd.id() as i32;
-        let stderr = cmd.stderr.take().unwrap();
-        let stdout = cmd.stdout.take().unwrap();
         let glv = Arc::new(Mutex::new(VecDeque::new()));
         let glv_clone = glv.clone();
         let fout = File::create("examples/out.txt").unwrap();
@@ -292,10 +236,17 @@ mod tests {
         let (mut global_manager, rx) =
             GlobalAsyncIOManager::new().expect("The GAM could not be initialized");
         global_manager.start_runtime(rx, glv_clone);
+        let _guard = global_manager.rt.enter();
         let tx_s = global_manager
             .give_sender()
-            .expect("The GAM had still not started up");
-        let task_m = AsyncTask::StreamIOToFile(stderr, stdout, ferr, fout, pid);
+            .expect("The GAM has not started up");
+        let mut cmd = unsafe {
+            create_child_exec_context("examples/test_one.sh".to_string(), &vec![])
+                .expect("spawning failed")
+        };
+        let pid = cmd.pid();
+        let (lerr, lout) = cmd.readers();
+        let task_m = AsyncTask::StreamIOToFile(lerr, lout, ferr, fout, pid);
         if let Err(e) = tx_s.send(task_m) {
             panic!("{}", e);
         };
@@ -307,35 +258,30 @@ mod tests {
 
     #[test]
     fn test_async_io_task_kill() {
+        let glv = Arc::new(Mutex::new(VecDeque::new()));
+        let (mut gam, rx) = GlobalAsyncIOManager::new().expect("The gam could not be started");
+        gam.start_runtime(rx, glv.clone());
+        let _guard = gam.rt.enter();
         let mut cmds = vec![];
         for index in 0..=3 {
             let name = format! {"{}_sleep_command", index};
-            let curr = Command::new("examples/test_one.sh")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("The process could not be spawned");
+            let curr = unsafe {
+                create_child_exec_context("examples/test_one.sh".to_string(), &vec![])
+                    .expect("Failed to spawn process")
+            };
             let ferr = File::create(format! {"examples/ferr_{}.txt", index}).unwrap();
             let fout = File::create(format! {"examples/fout_{}.txt", index}).unwrap();
-            let id = curr.id();
+            let id = curr.pid();
             cmds.push((name, curr, ferr, fout, id as i32))
         }
         //we have 4 spawned tasks
         //we'll start them, and then kill one of them before its able to write the last string to it's stderr
         //we'll then assert that the glv has 7 contents in it
-        let glv = Arc::new(Mutex::new(VecDeque::new()));
-        let (mut gam, rx) = GlobalAsyncIOManager::new().expect("The gam could not be started");
-        gam.start_runtime(rx, glv.clone());
         let third_tup_id = cmds[3].4;
         for tup in cmds {
             let mut cmd = tup.1;
-            let task = AsyncTask::StreamIOToFile(
-                cmd.stderr.take().unwrap(),
-                cmd.stdout.take().unwrap(),
-                tup.2,
-                tup.3,
-                tup.4,
-            );
+            let (cerr, cout) = cmd.readers();
+            let task = AsyncTask::StreamIOToFile(cerr, cout, tup.2, tup.3, tup.4);
             let tx_s = gam.give_sender().unwrap();
             tx_s.send(task).unwrap();
         }
