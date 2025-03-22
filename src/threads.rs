@@ -131,6 +131,7 @@ impl GlobalAsyncIOManager {
         }
     }
 
+    //this doesn't kill the process; it just collects the handle
     pub fn kill_async(handle: JoinHandle<AsyncResult<()>>) {
         handle.abort();
     }

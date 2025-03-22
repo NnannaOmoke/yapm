@@ -29,6 +29,10 @@ use nix::sys::signal::SIGCONT;
 use nix::sys::signal::SIGKILL;
 use nix::sys::signal::SIGSTOP;
 
+use nix::sys::wait::waitpid;
+use nix::sys::wait::WaitPidFlag;
+pub use nix::sys::wait::WaitStatus;
+
 use nix::unistd::dup2;
 use nix::unistd::execv;
 use nix::unistd::fork;
@@ -104,6 +108,7 @@ impl AsyncRead for ManagedStream {
 }
 
 //we just have this for debug purposes right now
+#[derive(Debug)]
 pub struct ManagedLinuxProcess {
     pid: Pid,
     stderr: Option<ManagedStream>,
@@ -111,7 +116,7 @@ pub struct ManagedLinuxProcess {
 }
 
 impl ManagedLinuxProcess {
-    pub fn sigkill(self) -> LinuxOpResult<()> {
+    pub fn sigkill(&mut self) -> LinuxOpResult<()> {
         kill_process_sigkill(self.pid.as_raw())?;
         Ok(())
     }
@@ -129,6 +134,11 @@ impl ManagedLinuxProcess {
 
     pub fn pid(&self) -> i32 {
         self.pid.as_raw()
+    }
+
+    pub fn wait(&mut self) -> LinuxOpResult<WaitStatus> {
+        let s = waitpid(self.pid, Some(WaitPidFlag::WUNTRACED))?;
+        Ok(s)
     }
 }
 

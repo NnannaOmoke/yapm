@@ -4,14 +4,12 @@ use std::fs::File;
 
 use std::path::PathBuf;
 
-use std::process::ChildStderr;
-use std::process::ChildStdout;
-
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use thiserror::Error;
 
+use crate::core::platform::linux::LinuxAsyncLines;
 use crate::core::task::TaskError;
 
 #[cfg(target_os = "linux")]
@@ -53,8 +51,8 @@ pub enum FMaxSize {
 pub struct ProcessLogger {
     stderr: File,
     stdout: File,
-    stderr_src: Option<ChildStderr>,
-    stdout_src: Option<ChildStdout>,
+    stderr_src: Option<LinuxAsyncLines>,
+    stdout_src: Option<LinuxAsyncLines>,
     fmax_size: FMaxSize,
     pid: i32, //incase we need to do any weird stuff with the linux ABI
 }
@@ -152,7 +150,7 @@ impl ProcessLogger {
         });
     }
 
-    pub fn set_handles(&mut self, stderr: ChildStderr, stdout: ChildStdout) {
+    pub fn set_handles(&mut self, stderr: LinuxAsyncLines, stdout: LinuxAsyncLines) {
         self.stderr_src = Some(stderr);
         self.stdout_src = Some(stdout);
     }

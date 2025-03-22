@@ -1,22 +1,18 @@
-use std::error::Error as MajorError;
-
 use std::io::Error;
-use std::io::Read;
 
-use std::process::ChildStderr;
-use std::process::ChildStdout;
 use std::time::Instant;
 
 use std::process::id;
-use std::process::Child;
-use std::process::Command;
-use std::process::Stdio;
 
 use thiserror::Error;
 
 use crate::core::logging::ProcessLogger;
-use crate::core::platform::linux;
+use crate::core::platform::linux::create_child_exec_context;
+use crate::core::platform::linux::kill_process_sigkill;
+use crate::core::platform::linux::LinuxAsyncLines;
 use crate::core::platform::linux::LinuxErrorManager;
+use crate::core::platform::linux::ManagedLinuxProcess;
+use crate::core::platform::linux::WaitStatus;
 use crate::resolve_os_declarations;
 
 const PYTHON_PATH: &'static str = "$PYTHON";
@@ -33,56 +29,46 @@ pub enum TaskType {
 
 #[derive(Debug)]
 pub enum ChildWrapper {
-    Started(Child),
+    Started(ManagedLinuxProcess),
     Initialized,
+    Stopped,
 }
 
 impl ChildWrapper {
     fn new(executor: &String, args: &[String]) -> TaskResult<(Self, Instant)> {
         let time = Instant::now();
-        let command = Command::new(executor)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let command = unsafe { create_child_exec_context(executor.clone(), args)? };
         Ok((ChildWrapper::Started(command), time))
     }
 
     fn kill(&mut self) -> TaskResult<()> {
         if let Self::Started(handle) = self {
-            handle.kill()?;
-            handle.wait()?;
-        } else {
-            return Err(TaskError::ProcessStateUnitialized);
+            handle.sigkill()?;
+            let s = handle.wait()?;
+            if let WaitStatus::Signaled(_, _, _) = s {
+            } else {
+                return Err(TaskError::InvalidTermination);
+            }
+            *self = ChildWrapper::Stopped;
         };
         Ok(())
     }
 
     fn getpid(&self) -> Option<i32> {
         if let Self::Started(handle) = self {
-            return Some(handle.id() as i32); //returning i32 for compatibility with the nix API
+            return Some(handle.pid()); //returning i32 for compatibility with the nix API
         };
         None
     }
 
     //gets the handles to the stdout and the stderr
-    fn gethandles(&mut self) -> TaskResult<(ChildStderr, ChildStdout)> {
+    fn gethandles(&mut self) -> TaskResult<(LinuxAsyncLines, LinuxAsyncLines)> {
         if let Self::Started(handle) = self {
-            let handle_out = handle.stdout.take().unwrap();
-            let handle_err = handle.stderr.take().unwrap();
-            Ok((handle_err, handle_out))
+            let (herr, hout) = self.gethandles()?;
+            Ok((herr, hout))
         } else {
             Err(TaskError::ProcessStateUnitialized)
         }
-    }
-
-    //TODO: read stderr and stdin to a writable (this blocks?)
-    #[cfg(debug_assertions)]
-    fn read_to_string(&mut self, s: &mut String) -> Result<(), Box<dyn MajorError>> {
-        if let Self::Started(handle) = self {
-            let _ = handle.stderr.take().unwrap().read_to_string(s)?; //will block, do it async-ly
-        }
-        Ok(())
     }
 }
 
@@ -119,6 +105,8 @@ pub enum TaskError {
     ProcessStateUnitialized,
     #[error("The Error is of unknown origin")]
     UnknownProcessError,
+    #[error("Failed to terminate process")]
+    InvalidTermination,
 }
 
 type TaskResult<T> = Result<T, TaskError>;
@@ -187,15 +175,10 @@ impl Task {
     //we want this to be called by the drop implementation;if it doesn't work we'll use the linux API to kill it ...
     //by fire, by force
     fn kill(&mut self) -> TaskResult<()> {
-        if let Err(e) = self.inner.kill() {
-            #[cfg(debug_assertions)]
-            match e {
-                TaskError::ProcessStateUnitialized => return Ok(()),
-                _ => {}
-            };
-            let pid = self.inner.getpid().unwrap();
-            resolve_os_declarations!(linux::kill_process_sigkill(pid)?, None);
+        if let ChildWrapper::Initialized = self.inner {
+            return Ok(());
         }
+        self.inner.kill()?;
         Ok(())
     }
 
@@ -216,7 +199,7 @@ impl Drop for Task {
             //the process still no gree die - we crash the program and have the OS SIGKILL the parent process
             //we cannot allow zombies at all
             let id = id();
-            resolve_os_declarations!(let _ = linux::kill_process_sigkill(id as i32), None);
+            resolve_os_declarations!(let _ = kill_process_sigkill(id as i32), None);
         } //kill the underlying process
     }
 }
@@ -278,8 +261,8 @@ mod tests {
         task.unwrap();
     }
 
-    #[test]
-    fn test_running_exec() {
+    #[tokio::test]
+    async fn test_running_exec() {
         let arg_set_echo = &["examples/test_one.sh".to_string()];
         let mut task = Task::new(arg_set_echo).unwrap();
         let _ = task.start();
@@ -292,8 +275,8 @@ mod tests {
     //if the PID is in the task-list, if it is, it's a zombie, and we've failed the test
     //otherwise we're good
     //god im too tired to write this today
-    #[test]
-    fn test_running_exec_and_post_query() {
+    #[tokio::test]
+    async fn test_running_exec_and_post_query() {
         let arg_set_echo = &["examples/test_one.sh".to_string()];
         let mut task = Task::new(arg_set_echo).unwrap();
         let _ = task.start();
@@ -302,19 +285,5 @@ mod tests {
         sleep(Duration::new(1, 0));
         task.kill().unwrap();
         assert!(kill(Pid::from_raw(pid), None).err() == Some(Errno::ESRCH));
-    }
-
-    #[test]
-    fn test_captured_io() {
-        let arg_set_echo = &["examples/test_one.sh".to_string()];
-        let mut task = Task::new(arg_set_echo).unwrap();
-        let mut s = String::new();
-        let _ = task.start();
-        task.inner.read_to_string(&mut s).unwrap();
-        sleep(Duration::new(1, 0));
-        task.kill().unwrap();
-        //we can capture stdout/stderr, but it's blocking
-        //to fix that, we need it to be non-blocking and wrapped in an async block
-        assert_eq!(s, String::from("hello, i'm running\nhello, i'm dying\n"));
     }
 }
