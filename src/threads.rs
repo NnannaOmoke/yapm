@@ -1,5 +1,5 @@
+use crate::core::logging::ProcessLogger;
 use crate::core::platform::linux::LinuxAsyncLines;
-use crate::core::platform::linux::ManagedStream;
 
 use std::collections::VecDeque;
 
@@ -20,9 +20,6 @@ use time::error::IndeterminateOffset;
 // use time::util::local_offset::Soundness;
 use time::OffsetDateTime;
 
-use tokio::io::BufReader;
-use tokio::io::Lines;
-
 use tokio::runtime::Builder;
 use tokio::runtime::Runtime;
 
@@ -32,9 +29,22 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use tokio::task::JoinHandle;
 
+pub type TaskSender = UnboundedSender<AsyncTask>;
+
 #[derive(Debug)]
 pub enum AsyncTask {
     StreamIOToFile(LinuxAsyncLines, LinuxAsyncLines, File, File, i32),
+    //error size, out size, error, error, ferr, fout, pid
+    StreamLogTask(
+        usize,
+        u64,
+        u64,
+        LinuxAsyncLines,
+        LinuxAsyncLines,
+        File,
+        File,
+        i32,
+    ),
     KillThread(i32),
 }
 
@@ -91,7 +101,7 @@ impl GlobalAsyncIOManager {
         let handle = self.rt.spawn(Self::coordinator(rx, glv));
     }
 
-    pub fn give_sender(&self) -> AsyncResult<UnboundedSender<AsyncTask>> {
+    pub fn give_sender(&self) -> AsyncResult<TaskSender> {
         if let RuntimeState::Running = self.state {
             Ok(self.sender.clone())
         } else {
@@ -117,6 +127,39 @@ impl GlobalAsyncIOManager {
                     });
                     tasks.push((pid, handle_err, handle_out));
                 }
+                AsyncTask::StreamLogTask(
+                    size_max,
+                    size_err,
+                    size_out,
+                    stderr,
+                    stdout,
+                    ferr,
+                    fout,
+                    pid,
+                ) => {
+                    let another = glv.clone();
+                    let handle_err = tokio::spawn(async move {
+                        Self::truncate_stream_stderr(
+                            stderr,
+                            ferr,
+                            glv_clone,
+                            size_max as u64,
+                            size_err as u64,
+                        )
+                        .await
+                    });
+                    let handle_out = tokio::spawn(async move {
+                        Self::truncate_stream_stdout(
+                            stdout,
+                            fout,
+                            another,
+                            size_max as u64,
+                            size_err as u64,
+                        )
+                        .await
+                    });
+                    tasks.push((pid, handle_err, handle_out));
+                }
                 AsyncTask::KillThread(pid) => {
                     //get the task, handle pair, collect it and then remove it
                     if let Some(pos) = tasks.iter().position(|&(ipid, _, _)| ipid == pid) {
@@ -137,70 +180,42 @@ impl GlobalAsyncIOManager {
     }
 
     pub async fn stream_stderr(
-        mut stderr: Lines<BufReader<ManagedStream>>,
-        mut ferr: File,
+        stderr: LinuxAsyncLines,
+        ferr: File,
         glv: Arc<Mutex<VecDeque<String>>>,
         pid: i32,
     ) -> AsyncResult<()> {
-        while let Some(line) = stderr.next_line().await? {
-            let time = OffsetDateTime::now_local()?;
-            let complete = format! {
-                "ErrStream: [{}:{}:{}, {}:{}:{}] {}\n",
-                time.hour(),
-                time.minute(),
-                time.second(),
-                time.day(),
-                time.month(),
-                time.year(),
-                line
-            };
-            ferr.write(complete.as_bytes())?;
-            ferr.flush()?;
-            let curr = glv.clone();
-            let lock = curr.lock();
-            if let Ok(mut lk) = lock {
-                if lk.len() >= 10 {
-                    lk.pop_front();
-                    lk.push_back(complete);
-                } else {
-                    lk.push_back(complete);
-                }
-            }
-        }
-        Ok(())
+        stream_to_file(stderr, ferr, glv, true).await
     }
 
     pub async fn stream_stdout(
-        mut stdout: Lines<BufReader<ManagedStream>>,
-        mut ferr: File,
+        stdout: LinuxAsyncLines,
+        ferr: File,
         glv: Arc<Mutex<VecDeque<String>>>,
         pid: i32,
     ) -> AsyncResult<()> {
-        while let Some(line) = stdout.next_line().await? {
-            let time = OffsetDateTime::now_local()?;
-            let complete = format! {
-                "OutStream: [{}:{}:{}, {}:{}:{}] {}\n",
-                time.hour(),
-                time.minute(),
-                time.second(),
-                time.day(),
-                time.month(),
-                time.year(),
-                line
-            };
-            ferr.write(complete.as_bytes())?;
-            ferr.flush()?;
-            let curr = glv.clone();
-            let lock = curr.lock();
-            if let Ok(mut lk) = lock {
-                if lk.len() >= 10 {
-                    lk.pop_front();
-                    lk.push_back(complete);
-                } else {
-                    lk.push_back(complete);
-                }
-            }
-        }
+        stream_to_file(stdout, ferr, glv, false).await
+    }
+
+    pub async fn truncate_stream_stderr(
+        stderr: LinuxAsyncLines,
+        ferr: File,
+        glv: Arc<Mutex<VecDeque<String>>>,
+        max_size: u64,
+        curr_size: u64,
+    ) -> AsyncResult<()> {
+        truncate_stream_to_file(max_size, curr_size, stderr, ferr, glv, true).await?;
+        Ok(())
+    }
+
+    pub async fn truncate_stream_stdout(
+        stdout: LinuxAsyncLines,
+        fout: File,
+        glv: Arc<Mutex<VecDeque<String>>>,
+        max_size: u64,
+        curr_size: u64,
+    ) -> AsyncResult<()> {
+        truncate_stream_to_file(max_size, curr_size, stdout, fout, glv, false).await?;
         Ok(())
     }
 
@@ -209,6 +224,83 @@ impl GlobalAsyncIOManager {
         //should block for about a second
         self.rt.shutdown_timeout(Duration::from_secs(1));
     }
+}
+
+pub async fn stream_to_file(
+    mut source: LinuxAsyncLines,
+    mut target: File,
+    inter: Arc<Mutex<VecDeque<String>>>,
+    tstream: bool,
+) -> AsyncResult<()> {
+    let tstream = if tstream { "OutStream" } else { "ErrStream" };
+    while let Some(line) = source.next_line().await? {
+        let time = OffsetDateTime::now_local()?;
+        let complete = format! {
+            "{}: [{}:{}:{}, {}:{}:{}] {}\n",
+            tstream,
+            time.hour(),
+            time.minute(),
+            time.second(),
+            time.day(),
+            time.month(),
+            time.year(),
+            line
+        };
+        target.write(complete.as_bytes())?;
+        target.flush()?;
+        let curr = inter.clone();
+        let lock = curr.lock();
+        if let Ok(mut lk) = lock {
+            if lk.len() >= 10 {
+                lk.pop_front();
+                lk.push_back(complete);
+            } else {
+                lk.push_back(complete);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn truncate_stream_to_file(
+    max_size: u64,
+    mut curr_size: u64,
+    mut source: LinuxAsyncLines,
+    mut target: File,
+    inter: Arc<Mutex<VecDeque<String>>>,
+    tstream: bool,
+) -> AsyncResult<()> {
+    let tstream = if tstream { "OutStream" } else { "ErrStream" };
+    while let Some(line) = source.next_line().await? {
+        let time = OffsetDateTime::now_local()?;
+        let complete = format! {
+            "{}: [{}:{}:{}, {}:{}:{}] {}\n",
+            tstream,
+            time.hour(),
+            time.minute(),
+            time.second(),
+            time.day(),
+            time.month(),
+            time.year(),
+            line
+        };
+        target.write(complete.as_bytes())?;
+        target.flush()?;
+        curr_size += complete.len() as u64;
+        let curr = inter.clone();
+        let lock = curr.lock();
+        if let Ok(mut lk) = lock {
+            if lk.len() >= 10 {
+                lk.pop_front();
+                lk.push_back(complete);
+            } else {
+                lk.push_back(complete);
+            }
+        }
+        //TODO: appropriate error conversion here
+        ProcessLogger::truncate_file(max_size, curr_size, &mut target).expect("");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
