@@ -1,3 +1,6 @@
+use crate::core::platform::consts::LinuxSyscallConsts;
+use crate::core::platform::traits::DisobeyPolicy;
+
 use std::ffi::CString;
 
 use std::io::Result as IOResult;
@@ -11,7 +14,14 @@ use cgroups_rs::Resources;
 
 use futures::ready;
 
-use nix::errno::Errno;
+use libseccomp::error::SeccompError;
+pub use libseccomp::ScmpAction;
+use libseccomp::ScmpArgCompare;
+use libseccomp::ScmpCompareOp;
+use libseccomp::ScmpFilterContext;
+use libseccomp::ScmpSyscall;
+
+pub use nix::errno::Errno;
 
 use nix::libc::STDERR_FILENO;
 use nix::libc::STDOUT_FILENO;
@@ -51,6 +61,49 @@ use thiserror::Error;
 
 pub type LinuxAsyncLines = Lines<BufReader<ManagedStream>>;
 type LinuxOpResult<T> = Result<T, LinuxErrorManager>;
+
+#[derive(Default)]
+pub enum CPUPriority {
+    Max,
+    VeryHigh,
+    High,
+    #[default]
+    Normal,
+    Low,
+    VeryLow,
+    Lowest,
+}
+
+#[derive(Default)]
+pub enum MemReqs {
+    #[default]
+    Unlimited,
+    Specific(u64),
+}
+
+#[derive(Debug, Error)]
+pub enum LinuxErrorManager {
+    #[error("SIGKILL could not terminate the running process; YAPM does not have the neccessary permissions to terminate the child process")]
+    SigKillNoPerm,
+    #[error(
+        "SIGKILL could not terminate the target process; It either does not exist or has been terminated already"
+    )]
+    SigKillNoExist,
+    #[error("A seccomp action has failed: {}", .0)]
+    SeccompError(#[from] SeccompError),
+    #[error("There has been an unknown error: {}", .0)]
+    UnexpectedError(Errno),
+}
+
+impl From<Errno> for LinuxErrorManager {
+    fn from(err: Errno) -> Self {
+        match err {
+            Errno::EPERM => LinuxErrorManager::SigKillNoPerm,
+            Errno::ESRCH => LinuxErrorManager::SigKillNoExist,
+            err_code => LinuxErrorManager::UnexpectedError(err_code),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ManagedStream {
@@ -140,46 +193,13 @@ impl ManagedLinuxProcess {
         let s = waitpid(self.pid, Some(WaitPidFlag::WUNTRACED))?;
         Ok(s)
     }
-}
 
-#[derive(Default)]
-pub enum CPUPriority {
-    Max,
-    VeryHigh,
-    High,
-    #[default]
-    Normal,
-    Low,
-    VeryLow,
-    Lowest,
-}
-
-#[derive(Default)]
-pub enum MemReqs {
-    #[default]
-    Unlimited,
-    Specific(u64),
-}
-
-#[derive(Debug, Error)]
-pub enum LinuxErrorManager {
-    #[error("SIGKILL could not terminate the running process; YAPM does not have the neccessary permissions to terminate the child process")]
-    SigKillNoPerm,
-    #[error(
-        "SIGKILL could not terminate the target process; It either does not exist or has been terminated already"
-    )]
-    SigKillNoExist,
-    #[error("There has been an unknown error: {}", .0)]
-    UnexpectedError(Errno),
-}
-
-impl From<Errno> for LinuxErrorManager {
-    fn from(err: Errno) -> Self {
-        match err {
-            Errno::EPERM => LinuxErrorManager::SigKillNoPerm,
-            Errno::ESRCH => LinuxErrorManager::SigKillNoExist,
-            err_code => LinuxErrorManager::UnexpectedError(err_code),
-        }
+    #[cfg(debug_assertions)]
+    async fn read_to_string(&mut self) -> LinuxOpResult<String> {
+        let mut berr = BufReader::new(self.stderr.take().unwrap());
+        let mut string = String::new();
+        berr.read_line(&mut string).await.expect("");
+        Ok(string)
     }
 }
 
@@ -219,6 +239,45 @@ pub unsafe fn create_child_exec_context(
     };
 }
 
+pub unsafe fn test_create_child_exec_context(
+    target: String,
+    args: &[String],
+) -> LinuxOpResult<ManagedLinuxProcess> {
+    let (stderr_read_fd, stderr_write_fd) = pipe()?;
+    let (stdout_read_fd, stdout_write_fd) = pipe()?;
+    match fork()? {
+        ForkResult::Parent { child } => {
+            let merr = ManagedStream::new(stderr_read_fd)?;
+            let mout = ManagedStream::new(stdout_read_fd)?;
+            let value = ManagedLinuxProcess {
+                pid: child,
+                stderr: Some(merr),
+                stdout: Some(mout),
+            };
+            return Ok(value);
+        }
+        ForkResult::Child => {
+            //we can put in the security measures here, for now, we want to set up
+            //stderr and stdout
+            //some processing first
+            let target = CString::from_vec_unchecked(target.into_bytes());
+            let args = args
+                .iter()
+                .map(|f| CString::from_vec_unchecked(f.clone().into_bytes()))
+                .collect::<Vec<_>>();
+
+            dup2(stderr_write_fd.as_raw_fd(), STDERR_FILENO)?;
+            dup2(stdout_write_fd.as_raw_fd(), STDOUT_FILENO)?;
+
+            let mut ctx = init_seccomp_context()?;
+            seccomp_no_net(&mut ctx, DisobeyPolicy::NoPerm)?;
+            load_seccomp_ctx(&mut ctx)?;
+
+            execv(target.as_c_str(), &args)?;
+            unreachable!("Like, obviously, this isn't supposed to happen, lol");
+        }
+    };
+}
 pub fn kill_process_sigkill(id: i32) -> LinuxOpResult<()> {
     kill(Pid::from_raw(id), SIGKILL)?;
     Ok(())
@@ -274,6 +333,106 @@ pub fn set_process_mem_max_cgroups(
     Ok(())
 }
 
+// a single place to initialize a seccomp context
+pub fn init_seccomp_context() -> LinuxOpResult<ScmpFilterContext> {
+    let mut ctx = ScmpFilterContext::new_filter(ScmpAction::Allow)?;
+    ctx.add_arch(libseccomp::ScmpArch::Native)?;
+    Ok(ctx)
+}
+
+pub fn seccomp_no_net(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::NETWORK_SYSCALLS.iter() {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+    Ok(())
+}
+
+pub fn seccomp_no_fs(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::FS_WRITE_SYSCALLS
+        .iter()
+        .chain(LinuxSyscallConsts::FS_READ_SYSCALLS.iter())
+        .chain(LinuxSyscallConsts::FS_CONDITIONAL_SYSCALLS.iter())
+    {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+    Ok(())
+}
+
+pub fn seccomp_no_proc(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::PROCESS_CREATION_SYSCALLS
+        .iter()
+        .chain(LinuxSyscallConsts::PROCESS_CONTROL_SYSCALLS.iter())
+    {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+
+    let c = ScmpSyscall::from_name("clone")?; //allow for new thread creation
+    let cmp = ScmpArgCompare::new(0, ScmpCompareOp::Equal, 0x00010000);
+    ctx.add_rule_conditional(ScmpAction::Allow, c, &[cmp])?;
+    Ok(())
+}
+
+pub fn seccomp_no_thread(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    let c = ScmpSyscall::from_name("clone")?;
+    let cmp = ScmpArgCompare::new(0, ScmpCompareOp::Equal, 0x00010000);
+    ctx.add_rule_conditional(policy.into(), c, &[cmp])?;
+    Ok(())
+}
+
+pub fn seccomp_readonly_fs(
+    ctx: &mut ScmpFilterContext,
+    policy: DisobeyPolicy,
+) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::FS_WRITE_SYSCALLS.iter() {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+
+    let open = ScmpSyscall::from_name("open")?;
+
+    // Create a rule that blocks open calls with write access
+    // Arg1 is the flags argument to open
+    // Block if (flags & O_ACCMODE) == O_WRONLY or (flags & O_ACCMODE) == O_RDWR
+    let wronly_cmp = ScmpArgCompare::new(
+        1,
+        ScmpCompareOp::MaskedEqual(nix::libc::O_ACCMODE as u64),
+        nix::libc::O_WRONLY as u64,
+    );
+    let rdwr_cmp = ScmpArgCompare::new(
+        1,
+        ScmpCompareOp::MaskedEqual(nix::libc::O_ACCMODE as u64),
+        nix::libc::O_RDWR as u64,
+    );
+
+    ctx.add_rule_conditional(policy.into(), open, &[wronly_cmp])?;
+    ctx.add_rule_conditional(policy.into(), open, &[rdwr_cmp])?;
+
+    // Similar for openat (flags are arg2 instead of arg1)
+    let openat = ScmpSyscall::from_name("openat")?;
+    let openat_wronly_cmp = ScmpArgCompare::new(
+        2,
+        ScmpCompareOp::MaskedEqual(nix::libc::O_ACCMODE as u64),
+        nix::libc::O_WRONLY as u64,
+    );
+    let openat_rdwr_cmp = ScmpArgCompare::new(
+        2,
+        ScmpCompareOp::MaskedEqual(nix::libc::O_ACCMODE as u64),
+        nix::libc::O_RDWR as u64,
+    );
+
+    ctx.add_rule_conditional(policy.into(), openat, &[openat_wronly_cmp])?;
+    ctx.add_rule_conditional(policy.into(), openat, &[openat_rdwr_cmp])?;
+    Ok(())
+}
+
+pub fn load_seccomp_ctx(ctx: &mut ScmpFilterContext) -> LinuxOpResult<()> {
+    ctx.load()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -284,5 +443,17 @@ mod test {
             create_child_exec_context(String::from("examples/test_one.sh"), &vec![])
                 .expect("creating child process failed")
         };
+    }
+
+    #[tokio::test]
+    async fn test_no_net() {
+        let mut c = unsafe {
+            test_create_child_exec_context(String::from("examples/test_net.sh"), &vec![])
+                .expect("creating child process failed")
+        };
+        let (_, mut errst) = c.readers();
+        while let Some(line) = errst.next_line().await.expect("") {
+            dbg!(line);
+        }
     }
 }

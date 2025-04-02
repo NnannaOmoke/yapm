@@ -16,7 +16,7 @@ use crate::threads::AsyncTask;
 use crate::threads::TaskSender;
 
 #[cfg(target_os = "linux")]
-const DEFAULT_LOG_DIR_LOCATION: &'static str = "/usr/bin/yapm/logs";
+const DEFAULT_LOG_DIR_LOCATION: &'static str = "/var/log/yapm/";
 #[cfg(target_os = "windows")]
 static DEFAULT_LOG_DIR_LOCATION: &'static str = "";
 
