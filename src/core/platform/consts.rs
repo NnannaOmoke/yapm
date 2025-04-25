@@ -66,13 +66,20 @@ impl LinuxSyscallConsts {
         "fstat",
     ];
 
+    pub const FILE_BASED_IPC_SYSCALLS: [&str; 5] = [
+        "mknod",   // Creates FIFOs (named pipes)
+        "mknodat", // Same, with directory FD
+        "open",    // Opens FIFOs or Unix domain socket files
+        "openat",  // Same, with directory FD
+        "unlink",  // Removes FIFO files or socket files
+    ];
     pub const FS_CONDITIONAL_SYSCALLS: [&str; 2] = ["open", "openat"];
-    pub const PROCESS_CREATION_SYSCALLS: [&str; 11] = [
+    pub const PROCESS_CREATION_SYSCALLS: [&str; 10] = [
         "fork",
         "vfork",
         "clone",
         "clone3",
-        "execve",
+        //"execve",
         "execveat",
         "prctl",       // Can be used for various process control operations
         "unshare",     // Used to dissociate parts of the process execution context
@@ -94,5 +101,47 @@ impl LinuxSyscallConsts {
         "sched_setparam",     // Can be used to manipulate process behavior
         "sched_setaffinity",  // Can be used to manipulate process execution
         "ioprio_set",
+    ];
+
+    pub const PRIVILEGE_ESCALATION_SYSCALLS: [&str; 9] = [
+        "setuid",
+        "setgid",
+        "setreuid",
+        "setregid",
+        "setresuid",
+        "setresgid",
+        "setfsuid",
+        "setfsgid",
+        "capset", // Set process capabilities
+    ];
+
+    pub const SYSTEM_MANIPULATION_SYSCALLS: [&str; 10] = [
+        "reboot",
+        "syslog",
+        "acct", // Enable/disable process accounting
+        "settimeofday",
+        "swapon",
+        "swapoff",
+        "sysfs", // Get filesystem type information
+        "sethostname",
+        "setdomainname",
+        "iopl", // I/O privilege level control
+    ];
+
+    pub const IPC_SYSCALLS: [&str; 14] = [
+        "shmget", // Shared memory operations
+        "shmat",
+        "shmctl",
+        "shmdt",
+        "semget", // Semaphore operations
+        "semctl",
+        "semop",
+        "semtimedop",
+        "msgget", // Message queue operations
+        "msgsnd",
+        "msgrcv",
+        "msgctl",
+        "mq_open", // POSIX message queue
+        "mq_unlink",
     ];
 }

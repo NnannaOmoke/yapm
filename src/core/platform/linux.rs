@@ -3,11 +3,15 @@ use crate::core::platform::traits::DisobeyPolicy;
 
 use std::ffi::CString;
 
+use std::fs::OpenOptions;
+
+use std::io::BufRead;
 use std::io::Result as IOResult;
 
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 
+use std::str::SplitWhitespace;
 use std::task::Poll;
 
 use cgroups_rs::Resources;
@@ -15,6 +19,7 @@ use cgroups_rs::Resources;
 use futures::ready;
 
 use libseccomp::error::SeccompError;
+use libseccomp::scmp_cmp;
 pub use libseccomp::ScmpAction;
 use libseccomp::ScmpArgCompare;
 use libseccomp::ScmpCompareOp;
@@ -93,6 +98,8 @@ pub enum LinuxErrorManager {
     SeccompError(#[from] SeccompError),
     #[error("There has been an unknown error: {}", .0)]
     UnexpectedError(Errno),
+    #[error("An IO Operation failed: {}", .0)]
+    IOError(#[from] std::io::Error),
 }
 
 impl From<Errno> for LinuxErrorManager {
@@ -239,9 +246,12 @@ pub unsafe fn create_child_exec_context(
     };
 }
 
+#[cfg(debug_assertions)]
 pub unsafe fn test_create_child_exec_context(
     target: String,
     args: &[String],
+    scmp_fn: fn(&mut ScmpFilterContext, DisobeyPolicy) -> LinuxOpResult<()>,
+    policy: DisobeyPolicy,
 ) -> LinuxOpResult<ManagedLinuxProcess> {
     let (stderr_read_fd, stderr_write_fd) = pipe()?;
     let (stdout_read_fd, stdout_write_fd) = pipe()?;
@@ -270,14 +280,59 @@ pub unsafe fn test_create_child_exec_context(
             dup2(stdout_write_fd.as_raw_fd(), STDOUT_FILENO)?;
 
             let mut ctx = init_seccomp_context()?;
-            seccomp_no_net(&mut ctx, DisobeyPolicy::NoPerm)?;
+            scmp_fn(&mut ctx, policy)?;
             load_seccomp_ctx(&mut ctx)?;
 
-            execv(target.as_c_str(), &args)?;
+            execv(target.as_c_str(), &args).expect("Execve failed!");
             unreachable!("Like, obviously, this isn't supposed to happen, lol");
         }
     };
 }
+
+#[derive(Debug, Default)]
+struct LinuxRuntimeMetrics {
+    vmrss_kb: usize,
+    vmswap_kb: usize,
+    vmsize_kb: usize,
+    vmhwm_kb: usize,
+    rssanon_kb: usize,
+    rssfile_kb: usize,
+    rssshmem_kb: usize,
+}
+
+impl LinuxRuntimeMetrics {
+    ///Expects path given by: /proc/[pid]/status
+    //we don't know whether we want this to be `self` until the design of the application is complete
+    fn parse_mem_status(fpath: impl AsRef<std::fs::File>, pid: u32) -> LinuxOpResult<Self> {
+        // let path = format!("/proc/{}/status", pid);
+        let mut ret = Self::default();
+        //the next thing is that we want to go over each line and split:
+        let bufreader = std::io::BufReader::new(fpath.as_ref());
+        let lines = bufreader.lines();
+        for l in lines {
+            let l = l?;
+            let mut parts = l.split_whitespace();
+            let k = parts.next().unwrap_or("").trim_end_matches(":");
+            let value = match k {
+                "VmRSS" => &mut ret.vmrss_kb,
+                "VmSwap" => &mut ret.vmswap_kb,
+                "VmSize" => &mut ret.vmsize_kb,
+                "VmHWM" => &mut ret.vmhwm_kb,
+                "RssAnon" => &mut ret.rssanon_kb,
+                "RssFile" => &mut ret.rssfile_kb,
+                "RssShmem" => &mut ret.rssshmem_kb,
+                _ => continue,
+            };
+
+            *value = match parts.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+        }
+        Ok(ret)
+    }
+}
+
 pub fn kill_process_sigkill(id: i32) -> LinuxOpResult<()> {
     kill(Pid::from_raw(id), SIGKILL)?;
     Ok(())
@@ -335,7 +390,7 @@ pub fn set_process_mem_max_cgroups(
 
 // a single place to initialize a seccomp context
 pub fn init_seccomp_context() -> LinuxOpResult<ScmpFilterContext> {
-    let mut ctx = ScmpFilterContext::new_filter(ScmpAction::Allow)?;
+    let mut ctx = ScmpFilterContext::new(ScmpAction::Allow)?;
     ctx.add_arch(libseccomp::ScmpArch::Native)?;
     Ok(ctx)
 }
@@ -360,7 +415,48 @@ pub fn seccomp_no_fs(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> Linu
     Ok(())
 }
 
+pub fn seccomp_no_escalate(
+    ctx: &mut ScmpFilterContext,
+    policy: DisobeyPolicy,
+) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::PRIVILEGE_ESCALATION_SYSCALLS.iter() {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+    Ok(())
+}
+
+//disabled by default
+pub fn seccomp_no_ipc(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::IPC_SYSCALLS
+        .iter()
+        .chain(LinuxSyscallConsts::FILE_BASED_IPC_SYSCALLS.iter())
+    {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+    Ok(())
+}
+
+//enabled by default
+pub fn seccomp_no_sys(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    for syscall in LinuxSyscallConsts::SYSTEM_MANIPULATION_SYSCALLS.iter() {
+        let s = ScmpSyscall::from_name(syscall)?;
+        ctx.add_rule(policy.into(), s)?;
+    }
+    Ok(())
+}
+
+//right now, this blocks execve, so we can't spawn the applications.
+//we can modify the policy to allow for us to spawn the application however
+//TODO: modify function signature to allow for capture of proc-name and args, so we can construct a filter
+//that allows execve in such cases
 pub fn seccomp_no_proc(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
+    let c = ScmpSyscall::from_name("clone")?;
+    let cmp = scmp_cmp!($arg0 != 0x00010000);
+    ctx.add_rule_conditional(ScmpAction::Log, c, &[cmp]) //ScmpAction::Log; hack to allow forbidden syscalls be made without killing the process
+        //as seccomp will not allow you to use the default scmpaction for these, it's much easier to do this
+        .expect("The conditional operation did not succeed");
     for syscall in LinuxSyscallConsts::PROCESS_CREATION_SYSCALLS
         .iter()
         .chain(LinuxSyscallConsts::PROCESS_CONTROL_SYSCALLS.iter())
@@ -369,9 +465,6 @@ pub fn seccomp_no_proc(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> Li
         ctx.add_rule(policy.into(), s)?;
     }
 
-    let c = ScmpSyscall::from_name("clone")?; //allow for new thread creation
-    let cmp = ScmpArgCompare::new(0, ScmpCompareOp::Equal, 0x00010000);
-    ctx.add_rule_conditional(ScmpAction::Allow, c, &[cmp])?;
     Ok(())
 }
 
@@ -410,7 +503,6 @@ pub fn seccomp_readonly_fs(
     ctx.add_rule_conditional(policy.into(), open, &[wronly_cmp])?;
     ctx.add_rule_conditional(policy.into(), open, &[rdwr_cmp])?;
 
-    // Similar for openat (flags are arg2 instead of arg1)
     let openat = ScmpSyscall::from_name("openat")?;
     let openat_wronly_cmp = ScmpArgCompare::new(
         2,
@@ -433,6 +525,7 @@ pub fn load_seccomp_ctx(ctx: &mut ScmpFilterContext) -> LinuxOpResult<()> {
     Ok(())
 }
 
+//TODO: test that read-only fs works
 #[cfg(test)]
 mod test {
     use super::*;
@@ -448,12 +541,55 @@ mod test {
     #[tokio::test]
     async fn test_no_net() {
         let mut c = unsafe {
-            test_create_child_exec_context(String::from("examples/test_net.sh"), &vec![])
-                .expect("creating child process failed")
+            test_create_child_exec_context(
+                String::from("examples/test_net.sh"),
+                &vec![],
+                seccomp_no_net,
+                DisobeyPolicy::NoPerm,
+            )
+            .expect("creating child process failed")
         };
         let (_, mut errst) = c.readers();
         while let Some(line) = errst.next_line().await.expect("") {
             dbg!(line);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_proc() {
+        let mut c = unsafe {
+            match test_create_child_exec_context(
+                String::from("examples/test_proc.sh"),
+                &vec![],
+                seccomp_no_proc,
+                DisobeyPolicy::NoPerm,
+            ) {
+                Ok(c) => c,
+                Err(e) => panic!("{:?}: {}", e, e.to_string()),
+            }
+        };
+        let (_, mut errst) = c.readers();
+        while let Some(l) = errst.next_line().await.expect("") {
+            dbg!(l);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_ipc() {
+        let mut c = unsafe {
+            match test_create_child_exec_context(
+                String::from("examples/test_ipc.sh"),
+                &vec![],
+                seccomp_no_ipc,
+                DisobeyPolicy::NoPerm,
+            ) {
+                Ok(c) => c,
+                Err(e) => panic!("{:?}: {}", e, e.to_string()),
+            }
+        };
+        let (_, mut errst) = c.readers();
+        while let Some(l) = errst.next_line().await.expect("") {
+            dbg!(l);
         }
     }
 }
