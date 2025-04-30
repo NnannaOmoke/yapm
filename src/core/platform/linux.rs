@@ -3,15 +3,13 @@ use crate::core::platform::traits::DisobeyPolicy;
 
 use std::ffi::CString;
 
-use std::fs::OpenOptions;
-
 use std::io::BufRead;
+use std::io::Read;
 use std::io::Result as IOResult;
 
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 
-use std::str::SplitWhitespace;
 use std::task::Poll;
 
 use cgroups_rs::Resources;
@@ -303,24 +301,27 @@ struct LinuxRuntimeMetrics {
 impl LinuxRuntimeMetrics {
     ///Expects path given by: /proc/[pid]/status
     //we don't know whether we want this to be `self` until the design of the application is complete
-    fn parse_mem_status(fpath: impl AsRef<std::fs::File>, pid: u32) -> LinuxOpResult<Self> {
-        // let path = format!("/proc/{}/status", pid);
-        let mut ret = Self::default();
+    //this asref is for caching, we don't want to close the file handle when we're done!
+    //this is the only function that will use it in the first place
+    fn parse_mem_status<T: std::ops::Deref<Target = std::fs::File>>(
+        &mut self,
+        fpath: T,
+    ) -> LinuxOpResult<()> {
         //the next thing is that we want to go over each line and split:
-        let bufreader = std::io::BufReader::new(fpath.as_ref());
+        let bufreader = std::io::BufReader::new(fpath.deref());
         let lines = bufreader.lines();
         for l in lines {
             let l = l?;
             let mut parts = l.split_whitespace();
             let k = parts.next().unwrap_or("").trim_end_matches(":");
             let value = match k {
-                "VmRSS" => &mut ret.vmrss_kb,
-                "VmSwap" => &mut ret.vmswap_kb,
-                "VmSize" => &mut ret.vmsize_kb,
-                "VmHWM" => &mut ret.vmhwm_kb,
-                "RssAnon" => &mut ret.rssanon_kb,
-                "RssFile" => &mut ret.rssfile_kb,
-                "RssShmem" => &mut ret.rssshmem_kb,
+                "VmRSS" => &mut self.vmrss_kb,
+                "VmSwap" => &mut self.vmswap_kb,
+                "VmSize" => &mut self.vmsize_kb,
+                "VmHWM" => &mut self.vmhwm_kb,
+                "RssAnon" => &mut self.rssanon_kb,
+                "RssFile" => &mut self.rssfile_kb,
+                "RssShmem" => &mut self.rssshmem_kb,
                 _ => continue,
             };
 
@@ -329,7 +330,62 @@ impl LinuxRuntimeMetrics {
                 None => continue,
             };
         }
-        Ok(ret)
+        Ok(())
+    }
+
+    //TODO: return the Self struct here?
+    //TODO: that's not the only file we're reading from in the first place, honestly
+    //generates the filehandle for use
+    fn open_proc_file(pid: Pid) -> LinuxOpResult<(std::fs::File, std::fs::File, Self)> {
+        let mpath = format!("/proc/{}/status", pid);
+        let mfile = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .append(false)
+            .create_new(false)
+            .open(mpath)?;
+        let spath = format!("/proc/{}/stat", pid);
+        let sfile = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .append(false)
+            .create_new(false)
+            .open(spath)?;
+        return Ok((mfile, sfile, Self::default()));
+    }
+
+    fn parse_cpu_status<T: std::ops::Deref<Target = std::fs::File>>(
+        fpath: T,
+    ) -> LinuxOpResult<(usize, usize, usize, usize, usize)> {
+        let mut cont = String::new();
+        let mut bufr = std::io::BufReader::new(fpath.deref());
+        bufr.read_to_string(&mut cont)?;
+        let metrics = cont.split_whitespace().collect::<Vec<_>>();
+        //we need 13: utime, 14: stime, cutime: 15, cstime: 16, nthreads: 19
+        let uptime = metrics[13]
+            .parse::<usize>()
+            .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
+        let kerneltime = metrics[14]
+            .parse::<usize>()
+            .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
+        let childrenuptime = metrics[15]
+            .parse::<usize>()
+            .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
+        let childrenkerneltime = metrics[16]
+            .parse::<usize>()
+            .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
+        let nthreads = metrics[19]
+            .parse::<usize>()
+            .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
+        Ok((
+            uptime,
+            kerneltime,
+            childrenuptime,
+            childrenkerneltime,
+            nthreads,
+        ))
     }
 }
 
@@ -454,9 +510,8 @@ pub fn seccomp_no_sys(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> Lin
 pub fn seccomp_no_proc(ctx: &mut ScmpFilterContext, policy: DisobeyPolicy) -> LinuxOpResult<()> {
     let c = ScmpSyscall::from_name("clone")?;
     let cmp = scmp_cmp!($arg0 != 0x00010000);
-    ctx.add_rule_conditional(ScmpAction::Log, c, &[cmp]) //ScmpAction::Log; hack to allow forbidden syscalls be made without killing the process
-        //as seccomp will not allow you to use the default scmpaction for these, it's much easier to do this
-        .expect("The conditional operation did not succeed");
+    ctx.add_rule_conditional(ScmpAction::Log, c, &[cmp])?; //ScmpAction::Log; hack to allow forbidden syscalls be made without killing the process
+                                                           //as seccomp will not allow you to use the default scmpaction for these, it's much easier to do this
     for syscall in LinuxSyscallConsts::PROCESS_CREATION_SYSCALLS
         .iter()
         .chain(LinuxSyscallConsts::PROCESS_CONTROL_SYSCALLS.iter())
@@ -591,5 +646,24 @@ mod test {
         while let Some(l) = errst.next_line().await.expect("") {
             dbg!(l);
         }
+    }
+
+    #[tokio::test]
+    async fn get_process_memory_details() {
+        let c = unsafe {
+            create_child_exec_context(String::from("examples/test_proc.sh"), &vec![])
+                .expect("We could not spawn the process")
+        };
+        let pid = c.pid;
+        let (f, s, mut met) = LinuxRuntimeMetrics::open_proc_file(pid)
+            .expect("Could not read the proc file for this process");
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        met.parse_mem_status(std::rc::Rc::new(f).as_ref())
+            .expect("This operation failed, unexpectedly");
+        dbg!(met);
+        dbg!(pid);
+        tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+        let tup = LinuxRuntimeMetrics::parse_cpu_status(&s).expect("couldn't read cpu data");
+        dbg!(tup);
     }
 }

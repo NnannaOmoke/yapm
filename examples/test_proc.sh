@@ -9,6 +9,8 @@ print_error() {
 }
 
 # Test: Attempt to run an external command
+sleep 8
+
 echo "Attempting to run an external command..." >&2
 /bin/echo "Hello from external echo" || print_error "Running external command failed with exit code $?"
 
