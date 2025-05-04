@@ -54,6 +54,9 @@ use nix::unistd::read as nix_read;
 use nix::unistd::ForkResult;
 use nix::unistd::Pid;
 
+use serde::Deserialize;
+use serde::Serialize;
+
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
@@ -65,7 +68,7 @@ use thiserror::Error;
 pub type LinuxAsyncLines = Lines<BufReader<ManagedStream>>;
 type LinuxOpResult<T> = Result<T, LinuxErrorManager>;
 
-#[derive(Default)]
+#[derive(Eq, PartialEq, Default, Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum CPUPriority {
     Max,
     VeryHigh,
@@ -77,11 +80,31 @@ pub enum CPUPriority {
     Lowest,
 }
 
-#[derive(Default)]
+impl std::str::FromStr for CPUPriority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "max" => Ok(Self::Max),
+            "very high" => Ok(Self::VeryHigh),
+            "high" => Ok(Self::High),
+            "normal" => Ok(Self::Normal),
+            "low" => Ok(Self::Low),
+            "very low" => Ok(Self::VeryLow),
+            "lowest" => Ok(Self::Low),
+            _ => Err(format!(
+                "{} is not accepted as a parameter to use to tune cpu priority",
+                s
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum MemReqs {
     #[default]
     Unlimited,
-    Specific(u64),
+    Specific(usize),
 }
 
 #[derive(Debug, Error)]
@@ -289,6 +312,7 @@ pub unsafe fn test_create_child_exec_context(
 
 #[derive(Debug, Default)]
 struct LinuxRuntimeMetrics {
+    //
     vmrss_kb: usize,
     vmswap_kb: usize,
     vmsize_kb: usize,
@@ -296,6 +320,22 @@ struct LinuxRuntimeMetrics {
     rssanon_kb: usize,
     rssfile_kb: usize,
     rssshmem_kb: usize,
+
+    //cpu stuff
+    uptime: usize,
+    kernel_time: usize,
+    children_uptime: usize,
+    children_kerneltime: usize,
+    nthreads: usize,
+
+    //io stuff
+    read_bytes: usize,
+    write_bytes: usize,
+
+    //file handles
+    status_file: Option<std::fs::File>,
+    stat_file: Option<std::fs::File>,
+    io_file: Option<std::fs::File>,
 }
 
 impl LinuxRuntimeMetrics {
@@ -303,12 +343,43 @@ impl LinuxRuntimeMetrics {
     //we don't know whether we want this to be `self` until the design of the application is complete
     //this asref is for caching, we don't want to close the file handle when we're done!
     //this is the only function that will use it in the first place
-    fn parse_mem_status<T: std::ops::Deref<Target = std::fs::File>>(
-        &mut self,
-        fpath: T,
-    ) -> LinuxOpResult<()> {
+    pub fn new(pid: Pid) -> LinuxOpResult<Self> {
+        let mut metrics = Self::default();
+
+        let status = format!("/proc/{}/status", pid);
+        metrics.status_file = Some(Self::open_file(&status)?);
+        let stat = format!("/proc/{}/stat", pid);
+        metrics.stat_file = Some(Self::open_file(&stat)?);
+        let io = format!("/proc/{}/io", pid);
+        metrics.io_file = Some(Self::open_file(&io)?);
+        Ok(metrics)
+    }
+
+    pub fn refresh(&mut self) -> LinuxOpResult<()> {
+        self.parse_mem_status()?;
+        self.parse_io_status()?;
+        self.parse_cpu_status()?;
+        Ok(())
+    }
+
+    fn open_file(path: &str) -> LinuxOpResult<std::fs::File> {
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .append(false)
+            .create_new(false)
+            .open(path)?)
+    }
+
+    fn parse_mem_status(&mut self) -> LinuxOpResult<()> {
         //the next thing is that we want to go over each line and split:
-        let bufreader = std::io::BufReader::new(fpath.deref());
+        //TODO: create an illegal state error
+        let f = self
+            .status_file
+            .as_ref()
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+        let bufreader = std::io::BufReader::new(f);
         let lines = bufreader.lines();
         for l in lines {
             let l = l?;
@@ -332,60 +403,62 @@ impl LinuxRuntimeMetrics {
         }
         Ok(())
     }
-
-    //TODO: return the Self struct here?
-    //TODO: that's not the only file we're reading from in the first place, honestly
-    //generates the filehandle for use
-    fn open_proc_file(pid: Pid) -> LinuxOpResult<(std::fs::File, std::fs::File, Self)> {
-        let mpath = format!("/proc/{}/status", pid);
-        let mfile = std::fs::OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .append(false)
-            .create_new(false)
-            .open(mpath)?;
-        let spath = format!("/proc/{}/stat", pid);
-        let sfile = std::fs::OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .append(false)
-            .create_new(false)
-            .open(spath)?;
-        return Ok((mfile, sfile, Self::default()));
+    //file handles, this is `/proc/pid/fd`
+    fn parse_resource_status<T: std::ops::Deref<Target = std::fs::File>>(
+        fpath: T,
+    ) -> LinuxOpResult<usize> {
+        let mut bufr = std::io::BufReader::new(fpath.deref());
+        let mut target = String::new();
+        bufr.read_to_string(&mut target)?;
+        Ok(target.split_whitespace().count())
     }
 
-    fn parse_cpu_status<T: std::ops::Deref<Target = std::fs::File>>(
-        fpath: T,
-    ) -> LinuxOpResult<(usize, usize, usize, usize, usize)> {
+    fn parse_io_status(&mut self) -> LinuxOpResult<()> {
+        let f = self
+            .io_file
+            .as_ref()
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+        let bufr = std::io::BufReader::new(f);
+        //now we need to parse this
+        let lines = bufr.lines().take(2).collect::<Result<Vec<_>, _>>()?; //we have all the lines
+                                                                          //the next thing to do is to do this: we need to get the 0th and the 1st line
+        self.read_bytes = lines[0]
+            .strip_prefix("rchar: ")
+            .and_then(|f| f.parse::<usize>().ok())
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+        self.write_bytes = lines[1]
+            .strip_prefix("wchar: ")
+            .and_then(|f| f.parse::<usize>().ok())
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+        Ok(())
+    }
+
+    fn parse_cpu_status(&mut self) -> LinuxOpResult<()> {
         let mut cont = String::new();
-        let mut bufr = std::io::BufReader::new(fpath.deref());
+        let f = self
+            .stat_file
+            .as_ref()
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+        let mut bufr = std::io::BufReader::new(f);
         bufr.read_to_string(&mut cont)?;
         let metrics = cont.split_whitespace().collect::<Vec<_>>();
         //we need 13: utime, 14: stime, cutime: 15, cstime: 16, nthreads: 19
-        let uptime = metrics[13]
+        self.uptime = metrics[13]
             .parse::<usize>()
             .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
-        let kerneltime = metrics[14]
+        self.kernel_time = metrics[14]
             .parse::<usize>()
             .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
-        let childrenuptime = metrics[15]
+        self.children_uptime = metrics[15]
             .parse::<usize>()
             .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
-        let childrenkerneltime = metrics[16]
+        self.children_kerneltime = metrics[16]
             .parse::<usize>()
             .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
-        let nthreads = metrics[19]
+        self.nthreads = metrics[19]
             .parse::<usize>()
             .or(Err(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno)))?;
-        Ok((
-            uptime,
-            kerneltime,
-            childrenuptime,
-            childrenkerneltime,
-            nthreads,
-        ))
+        Ok(())
     }
 }
 
@@ -422,8 +495,8 @@ pub fn set_process_mem_max_rlimit(id: i32, mem_reqs: MemReqs) -> LinuxOpResult<(
     match mem_reqs {
         MemReqs::Specific(mibs) => setrlimit(
             Resource::RLIMIT_AS,
-            mibs * 1024 * 1024,
-            (mibs + 2) * 1024 * 1024,
+            mibs as u64 * 1024 * 1024,
+            (mibs as u64 + 2) * 1024 * 1024,
         )?,
         _ => setrlimit(Resource::RLIMIT_AS, RLIM_INFINITY, RLIM_INFINITY)?,
     }
@@ -655,15 +728,12 @@ mod test {
                 .expect("We could not spawn the process")
         };
         let pid = c.pid;
-        let (f, s, mut met) = LinuxRuntimeMetrics::open_proc_file(pid)
-            .expect("Could not read the proc file for this process");
+        let mut met = LinuxRuntimeMetrics::new(pid).expect("Something broke");
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-        met.parse_mem_status(std::rc::Rc::new(f).as_ref())
-            .expect("This operation failed, unexpectedly");
-        dbg!(met);
+        dbg!(&met);
         dbg!(pid);
         tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
-        let tup = LinuxRuntimeMetrics::parse_cpu_status(&s).expect("couldn't read cpu data");
-        dbg!(tup);
+        met.refresh().expect("Well, that didn't work");
+        dbg!(&met);
     }
 }

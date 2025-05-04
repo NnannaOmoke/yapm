@@ -10,6 +10,7 @@
 //TODO: we now want to look at ways to design permissions for processes
 //this would involve re-writing some functions from the Nix crate
 
+mod config;
 mod core;
 mod threads;
 
