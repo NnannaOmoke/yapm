@@ -4,8 +4,13 @@ use std::time::Instant;
 
 use std::process::id;
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
+use tokio::sync::Mutex;
+
+use crate::config::ProcessConfig;
 use crate::core::logging::ProcessLogger;
 use crate::core::platform::linux::create_child_exec_context;
 use crate::core::platform::linux::kill_process_sigkill;
@@ -15,9 +20,32 @@ use crate::core::platform::linux::ManagedLinuxProcess;
 use crate::core::platform::linux::WaitStatus;
 use crate::resolve_os_declarations;
 
+use super::platform::linux::LinuxRuntimeMetrics;
+
 const PYTHON_PATH: &'static str = "$PYTHON";
 const JAVASCRIPT_PATH: &'static str = "$";
 const TYPESCRIPT_PATH: &'static str = "$";
+
+#[cfg(target_os = "linux")]
+pub struct LinuxCurrentTask {
+    pub config: ProcessConfig,
+    pub inner: ManagedLinuxProcess,
+    pub metrics: LinuxRuntimeMetrics,
+}
+
+//this is meant to be constructed explicitly
+impl LinuxCurrentTask {
+    pub async fn refresh_metrics(&mut self) {
+        //TODO: this is a cop-out, we want something more explicit, next time
+        let _ = self.metrics.refresh();
+    }
+
+    pub async fn shutdown(reference: Arc<Mutex<Self>>) {
+        let me = Arc::clone(&reference);
+        let mut lock = me.lock().await;
+        let _ = lock.inner.sigkill();
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum TaskType {

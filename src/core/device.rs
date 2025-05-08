@@ -1,11 +1,14 @@
-use std::process::Child;
-use std::process::ChildStderr;
-use std::process::ChildStdin;
-use std::process::ChildStdout;
-
 use std::sync::Arc;
-use std::sync::RwLock;
+use tokio::sync::Mutex;
 
-struct Device {
-    current_tasks: Vec<Arc<RwLock<Child>>>,
+use dashmap::DashMap;
+
+use crate::config::GlobalConfig;
+
+use super::task::LinuxCurrentTask;
+#[cfg(target_os = "linux")]
+//represents global state of YAPM. This is the command interface, basically
+pub struct Device {
+    current_tasks: DashMap<String, Arc<Mutex<LinuxCurrentTask>>>,
+    cfg: GlobalConfig,
 }

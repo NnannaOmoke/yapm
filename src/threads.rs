@@ -1,6 +1,7 @@
 use crate::core::logging::ProcessLogger;
 use crate::core::platform::linux::LinuxAsyncLines;
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use std::fmt::Debug;
@@ -26,6 +27,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Mutex as AsyncMutex;
 
 use tokio::task::JoinHandle;
 
@@ -58,19 +60,311 @@ pub enum AsyncError {
     AysncIOError(#[from] std::io::Error),
     #[error("Time init error: {}", .0)]
     TimeError(#[from] IndeterminateOffset),
+    #[error("The task was not found in the async registry")]
+    TaskNotFound,
+    #[error("Inconsistent runtime state")]
+    InconsistentRuntimeState,
+    #[error("Sending the task to the runtime failed: {}", .msg)]
+    TaskSendError { msg: String },
 }
 
-enum RuntimeState {
-    Running,
-    Unavailable,
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for AsyncError {
+    fn from(value: tokio::sync::mpsc::error::SendError<T>) -> Self {
+        Self::TaskSendError {
+            msg: value.to_string(),
+        }
+    }
 }
 
 type AsyncResult<T> = Result<T, AsyncError>;
+type TaskId = usize;
+type Pid = u32;
+
+pub struct LoggingTask {
+    max_size: usize,
+    err_size: usize,
+    out_size: usize,
+    ierr: LinuxAsyncLines,
+    iout: LinuxAsyncLines,
+    ferr: File,
+    fout: File,
+    pid: Pid,
+}
+
+pub struct MetricsTask {
+    pid: Pid,
+    task_arc: Arc<AsyncMutex<()>>,
+}
+
+pub struct ReviveTask {
+    pid: Pid,
+    task_arc: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskStatus {
+    Running,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskType {
+    Logging,
+    Metrics,
+    Process,
+}
+
+#[derive(Debug)]
+pub struct TaskInfo {
+    id: TaskId,
+    pid: Pid,
+    ty: TaskType,
+    handles: Vec<JoinHandle<()>>,
+    status: TaskStatus,
+    created: OffsetDateTime,
+    desc: String,
+}
+
+struct TaskRegistry {
+    tasks: HashMap<TaskId, TaskInfo>,
+    pid_index: HashMap<Pid, Vec<TaskId>>,
+    next: TaskId,
+}
+
+impl TaskRegistry {
+    fn new() -> Self {
+        Self {
+            tasks: HashMap::new(),
+            pid_index: HashMap::new(),
+            next: 1,
+        }
+    }
+
+    fn allocate(&mut self) -> TaskId {
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+
+    fn register_task(&mut self, id: TaskId, pid: Pid, tty: TaskType, desc: String) {
+        let info = TaskInfo {
+            id,
+            pid,
+            ty: tty,
+            handles: vec![],
+            status: TaskStatus::Running,
+            created: OffsetDateTime::now_utc(),
+            desc,
+        };
+        self.tasks.insert(id, info);
+        self.pid_index.entry(pid).or_insert_with(Vec::new).push(id);
+    }
+
+    fn add_handle(&mut self, id: TaskId, handle: JoinHandle<()>) -> AsyncResult<()> {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.handles.push(handle);
+            Ok(())
+        } else {
+            Err(AsyncError::TaskNotFound)
+        }
+    }
+
+    fn update_status(&mut self, id: TaskId, status: TaskStatus) -> AsyncResult<()> {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.status = status;
+            Ok(())
+        } else {
+            Err(AsyncError::TaskNotFound)
+        }
+    }
+
+    fn get_task(&self, id: TaskId) -> Option<&TaskInfo> {
+        self.tasks.get(&id)
+    }
+
+    fn get_task_mut(&mut self, id: TaskId) -> Option<&mut TaskInfo> {
+        self.tasks.get_mut(&id)
+    }
+
+    fn get_tasks_by_pid(&self, pid: Pid) -> Vec<&TaskInfo> {
+        if let Some(ids) = self.pid_index.get(&pid) {
+            ids.iter().filter_map(|id| self.tasks.get(id)).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    fn remove_task(&mut self, id: TaskId) -> AsyncResult<TaskInfo> {
+        match self.tasks.remove(&id) {
+            Some(task) => {
+                if self.pid_index.remove(&task.pid).is_none() {
+                    return Err(AsyncError::InconsistentRuntimeState);
+                }
+                Ok(task)
+            }
+            None => Err(AsyncError::TaskNotFound),
+        }
+    }
+}
 
 pub struct GlobalAsyncIOManager {
     rt: Runtime,
     sender: UnboundedSender<AsyncTask>,
     state: RuntimeState,
+}
+
+pub struct TGlobalAsyncIOManager {
+    rt: Runtime,
+
+    log_sender: UnboundedSender<(TaskId, LoggingTask)>,
+    metrics_sender: UnboundedSender<(TaskId, MetricsTask)>,
+    process_sender: UnboundedSender<(TaskId, ReviveTask)>,
+
+    registry: Arc<AsyncMutex<TaskRegistry>>,
+    log_queue: Arc<AsyncMutex<VecDeque<String>>>,
+    state: RuntimeState,
+}
+
+impl TGlobalAsyncIOManager {
+    pub fn new() -> AsyncResult<Self> {
+        let (ltx, lrx) = unbounded_channel();
+        let (mtx, mrx) = unbounded_channel();
+        let (ptx, prx) = unbounded_channel();
+        let rt = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("YAPM async handler")
+            .build()?;
+        let registry = Arc::new(AsyncMutex::new(TaskRegistry::new()));
+        let lqueue = Arc::new(AsyncMutex::new(VecDeque::with_capacity(20)));
+
+        let mut manager = Self {
+            rt,
+            log_sender: ltx,
+            metrics_sender: mtx,
+            process_sender: ptx,
+            registry,
+            log_queue: lqueue,
+            state: RuntimeState::Unavailable,
+        };
+        manager.start_runtime(lrx, mrx, prx);
+        Ok(manager)
+    }
+
+    fn start_runtime(
+        &mut self,
+        lrx: UnboundedReceiver<(TaskId, LoggingTask)>,
+        mtx: UnboundedReceiver<(TaskId, MetricsTask)>,
+        rtx: UnboundedReceiver<(TaskId, ReviveTask)>,
+    ) {
+    }
+
+    fn is_runtime_up(&self) -> bool {
+        matches!(self.state, RuntimeState::Running)
+    }
+
+    pub async fn submit_logging_task(&self, task: LoggingTask, desc: &str) -> AsyncResult<TaskId> {
+        if !self.is_runtime_up() {
+            return Err(AsyncError::UnitializedRuntimeError);
+        }
+
+        let pid = task.pid;
+        let mut registry = self.registry.lock().await;
+        let id = registry.allocate();
+        registry.register_task(id, pid, TaskType::Logging, desc.to_string());
+        self.log_sender.send((id, task))?;
+        Ok(id)
+    }
+
+    pub async fn submit_metrics_task(&self, task: MetricsTask, desc: &str) -> AsyncResult<TaskId> {
+        if !self.is_runtime_up() {
+            return Err(AsyncError::UnitializedRuntimeError);
+        }
+        let pid = task.pid;
+        let mut registry = self.registry.lock().await;
+        let id = registry.allocate();
+        registry.register_task(id, pid, TaskType::Metrics, desc.to_string());
+        Ok(id)
+    }
+
+    pub async fn submit_process_monitoring_task(
+        &self,
+        task: ReviveTask,
+        desc: &str,
+    ) -> AsyncResult<TaskId> {
+        if !self.is_runtime_up() {
+            return Err(AsyncError::UnitializedRuntimeError);
+        }
+        let pid = task.pid;
+        let mut registry = self.registry.lock().await;
+        let id = registry.allocate();
+        registry.register_task(id, pid, TaskType::Metrics, desc.to_string());
+        Ok(id)
+    }
+
+    pub async fn kill_task(&self, task_id: TaskId) -> AsyncResult<()> {
+        let mut registry = self.registry.lock().await;
+        let task = registry
+            .get_task_mut(task_id)
+            .ok_or(AsyncError::TaskNotFound)?;
+        for handle in task.handles.iter_mut() {
+            handle.abort()
+        }
+        registry.update_status(task_id, TaskStatus::Completed)?;
+        Ok(())
+    }
+
+    pub async fn kill_tasks_by_pid(&self, pid: Pid) -> AsyncResult<()> {
+        let mut registry = self.registry.lock().await;
+        let tids = if let Some(tids) = registry.pid_index.get(&pid) {
+            tids.clone()
+        } else {
+            return Ok(());
+        };
+
+        for id in tids {
+            if let Some(task) = registry.get_task_mut(id) {
+                for h in task.handles.iter_mut() {
+                    h.abort()
+                }
+                task.status = TaskStatus::Completed;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_task_statuses(&self) -> Vec<(TaskId, Pid, TaskType, TaskStatus, String)> {
+        let registry = self.registry.lock().await;
+        registry
+            .tasks
+            .values()
+            .map(|t| (t.id, t.pid, t.ty.clone(), t.status.clone(), t.desc.clone()))
+            .collect()
+    }
+
+    pub async fn get_task_status(&self, task_id: TaskId) -> AsyncResult<TaskStatus> {
+        let registry = self.registry.lock().await;
+        registry
+            .get_task(task_id)
+            .map(|t| t.status.clone())
+            .ok_or(AsyncError::TaskNotFound)
+    }
+
+    pub async fn get_task_ids_by_pid(&self, pid: Pid) -> Vec<TaskId> {
+        let registry = self.registry.lock().await;
+        registry
+            .get_tasks_by_pid(pid)
+            .iter()
+            .map(|task| task.id)
+            .collect()
+    }
+}
+
+enum RuntimeState {
+    Running,
+    Unavailable,
 }
 
 impl GlobalAsyncIOManager {

@@ -311,7 +311,7 @@ pub unsafe fn test_create_child_exec_context(
 }
 
 #[derive(Debug, Default)]
-struct LinuxRuntimeMetrics {
+pub struct LinuxRuntimeMetrics {
     //
     vmrss_kb: usize,
     vmswap_kb: usize,

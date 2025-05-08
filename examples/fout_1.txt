@@ -1,2 +1,2 @@
-ErrStream: [17:8:30, 4:May:2025] hello, i'm running
-ErrStream: [17:8:35, 4:May:2025] hello, i'm dying
+ErrStream: [1:25:9, 5:May:2025] hello, i'm running
+ErrStream: [1:25:14, 5:May:2025] hello, i'm dying
