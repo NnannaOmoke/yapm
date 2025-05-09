@@ -1,5 +1,11 @@
+use crate::core::logging::LogEntry;
+use crate::core::logging::LogManager;
+use crate::core::logging::LogType;
 use crate::core::logging::ProcessLogger;
+use crate::core::platform::linux::monitor_process_life;
 use crate::core::platform::linux::LinuxAsyncLines;
+use crate::core::platform::linux::Pid;
+use crate::core::task::LinuxCurrentTask;
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -78,7 +84,6 @@ impl<T> From<tokio::sync::mpsc::error::SendError<T>> for AsyncError {
 
 type AsyncResult<T> = Result<T, AsyncError>;
 type TaskId = usize;
-type Pid = u32;
 
 pub struct LoggingTask {
     max_size: usize,
@@ -93,12 +98,12 @@ pub struct LoggingTask {
 
 pub struct MetricsTask {
     pid: Pid,
-    task_arc: Arc<AsyncMutex<()>>,
+    task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
 }
 
 pub struct ReviveTask {
     pid: Pid,
-    task_arc: Arc<Mutex<()>>,
+    task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +113,7 @@ pub enum TaskStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskType {
     Logging,
     Metrics,
@@ -126,7 +131,7 @@ pub struct TaskInfo {
     desc: String,
 }
 
-struct TaskRegistry {
+pub struct TaskRegistry {
     tasks: HashMap<TaskId, TaskInfo>,
     pid_index: HashMap<Pid, Vec<TaskId>>,
     next: TaskId,
@@ -222,7 +227,7 @@ pub struct TGlobalAsyncIOManager {
     process_sender: UnboundedSender<(TaskId, ReviveTask)>,
 
     registry: Arc<AsyncMutex<TaskRegistry>>,
-    log_queue: Arc<AsyncMutex<VecDeque<String>>>,
+    log_queue: Arc<AsyncMutex<LogManager>>,
     state: RuntimeState,
 }
 
@@ -237,7 +242,7 @@ impl TGlobalAsyncIOManager {
             .thread_name("YAPM async handler")
             .build()?;
         let registry = Arc::new(AsyncMutex::new(TaskRegistry::new()));
-        let lqueue = Arc::new(AsyncMutex::new(VecDeque::with_capacity(20)));
+        let lqueue = Arc::new(AsyncMutex::new(LogManager::new()));
 
         let mut manager = Self {
             rt,
@@ -258,6 +263,20 @@ impl TGlobalAsyncIOManager {
         mtx: UnboundedReceiver<(TaskId, MetricsTask)>,
         rtx: UnboundedReceiver<(TaskId, ReviveTask)>,
     ) {
+        let registry = self.registry.clone();
+        let log_queue = self.log_queue.clone();
+
+        self.rt.spawn(Self::logging_coordinator(
+            lrx,
+            registry.clone(),
+            log_queue.clone(),
+        ));
+
+        self.rt.spawn(Self::metrics_coordinator(
+            mtx,
+            registry.clone(),
+            log_queue.clone(),
+        ));
     }
 
     fn is_runtime_up(&self) -> bool {
@@ -283,11 +302,22 @@ impl TGlobalAsyncIOManager {
         }
         let pid = task.pid;
         let mut registry = self.registry.lock().await;
+        let tasks = registry.get_tasks_by_pid(pid);
+        if tasks
+            .iter()
+            .find(|tinfo| tinfo.ty == TaskType::Metrics)
+            .is_some()
+        {
+            // TODO: log and return
+            return Err(AsyncError::InconsistentRuntimeState);
+        };
         let id = registry.allocate();
         registry.register_task(id, pid, TaskType::Metrics, desc.to_string());
+        self.metrics_sender.send((id, task))?;
         Ok(id)
     }
 
+    //we have to perform the sanity check here, it's not enough to do it in the fn itself
     pub async fn submit_process_monitoring_task(
         &self,
         task: ReviveTask,
@@ -298,8 +328,18 @@ impl TGlobalAsyncIOManager {
         }
         let pid = task.pid;
         let mut registry = self.registry.lock().await;
+        let tasks = registry.get_tasks_by_pid(pid);
+        if tasks
+            .iter()
+            .find(|tinfo| tinfo.ty == TaskType::Process)
+            .is_some()
+        {
+            // TODO: log and return
+            return Err(AsyncError::InconsistentRuntimeState);
+        };
         let id = registry.allocate();
         registry.register_task(id, pid, TaskType::Metrics, desc.to_string());
+        self.process_sender.send((id, task))?;
         Ok(id)
     }
 
@@ -359,6 +399,141 @@ impl TGlobalAsyncIOManager {
             .iter()
             .map(|task| task.id)
             .collect()
+    }
+
+    async fn logging_coordinator(
+        mut rx: UnboundedReceiver<(TaskId, LoggingTask)>,
+        registry: Arc<AsyncMutex<TaskRegistry>>,
+        glv: Arc<AsyncMutex<LogManager>>,
+    ) {
+        while let Some((
+            id,
+            LoggingTask {
+                max_size,
+                err_size,
+                out_size,
+                ierr,
+                iout,
+                ferr,
+                fout,
+                pid,
+            },
+        )) = rx.recv().await
+        {
+            let reg = registry.clone();
+            let log = glv.clone();
+            let ehandle = tokio::spawn(async move {
+                if let Err(e) =
+                    Self::truncate_stream_stderr(ierr, ferr, log.clone(), max_size, err_size).await
+                {
+                    let mut g = reg.lock().await;
+                    let _ = g.update_status(
+                        id,
+                        TaskStatus::Failed(format!(
+                            "Error streaming has failed for task-id: {}: {}",
+                            id,
+                            e.to_string()
+                        )),
+                    );
+                    let lock = log.lock().await;
+                    //TODO: write something so that YAPM can log that this failed
+                };
+            });
+            let reg = registry.clone();
+            let log = glv.clone();
+            let ohandle = tokio::spawn(async move {
+                if let Err(e) =
+                    Self::truncate_stream_stdout(iout, fout, log, max_size, err_size).await
+                {
+                    let mut g = reg.lock().await;
+                    let _ = g.update_status(
+                        id,
+                        TaskStatus::Failed(format!(
+                            "Error streaming has failed for task-id: {}: {}",
+                            id,
+                            e.to_string()
+                        )),
+                    );
+                    //TODO: write something so that YAPM can log that this failed
+                };
+            });
+            let mut rlock = registry.lock().await;
+            let _ = rlock.add_handle(id, ehandle);
+            let _ = rlock.add_handle(id, ohandle);
+        }
+    }
+
+    pub async fn truncate_stream_stderr(
+        stderr: LinuxAsyncLines,
+        ferr: File,
+        glv: Arc<AsyncMutex<LogManager>>,
+        max_size: usize,
+        curr_size: usize,
+    ) -> AsyncResult<()> {
+        async_truncate_stream_to_file(max_size, curr_size, stderr, ferr, glv, true).await?;
+        Ok(())
+    }
+
+    pub async fn truncate_stream_stdout(
+        stdout: LinuxAsyncLines,
+        fout: File,
+        glv: Arc<AsyncMutex<LogManager>>,
+        max_size: usize,
+        curr_size: usize,
+    ) -> AsyncResult<()> {
+        async_truncate_stream_to_file(
+            max_size as usize,
+            curr_size as usize,
+            stdout,
+            fout,
+            glv,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn metrics_coordinator(
+        mut rx: UnboundedReceiver<(TaskId, MetricsTask)>,
+        registry: Arc<AsyncMutex<TaskRegistry>>,
+        log_queue: Arc<AsyncMutex<LogManager>>,
+    ) {
+        while let Some((id, MetricsTask { pid, task_arc })) = rx.recv().await {
+            let reg = registry.clone();
+            let log = log_queue.clone();
+            //perform a check if this task is already running for this pid in the registry
+            //asynchronous, execution proceeds to the next rust-truction
+            let handle = tokio::spawn(async move {
+                let interval = tokio::time::Duration::from_millis(20);
+                loop {
+                    let mut g = task_arc.lock().await;
+                    let _ = g.metrics.refresh(); //TODO: log failure with YAPM
+                    tokio::time::sleep(interval).await;
+                }
+            });
+            let mut rlock = reg.lock().await;
+            let _ = rlock.add_handle(id, handle);
+        }
+    }
+
+    pub async fn revive_coordinator(
+        mut rx: UnboundedReceiver<(TaskId, ReviveTask)>,
+        log_queue: Arc<AsyncMutex<LogManager>>,
+        registry: Arc<AsyncMutex<TaskRegistry>>,
+    ) {
+        while let Some((id, ReviveTask { pid, task_arc })) = rx.recv().await {
+            //we're about to do sorcery
+            match monitor_process_life(Pid::from(pid)).await {
+                Ok(status) => {
+                    //we have to deal with this
+                    let mut g = task_arc.lock().await;
+                    g.respawn();
+                }
+                Err(e) => {
+                    //we also have to deal with this
+                }
+            };
+        }
     }
 }
 
@@ -556,6 +731,33 @@ pub async fn stream_to_file(
     Ok(())
 }
 
+pub async fn async_truncate_stream_to_file(
+    max_size: usize,
+    mut curr_size: usize,
+    mut source: LinuxAsyncLines,
+    mut target: File,
+    inter: Arc<AsyncMutex<LogManager>>,
+    tstream: bool,
+) -> AsyncResult<()> {
+    let tstream = if tstream {
+        LogType::Stdout
+    } else {
+        LogType::Stderr
+    };
+    while let Some(line) = source.next_line().await? {
+        let entry = LogEntry::new(tstream, line).unwrap();
+        let complete = entry.to_fstring();
+        target.write(complete.as_bytes())?;
+        target.flush()?;
+        curr_size += complete.len();
+        let mut lock = inter.lock().await;
+        lock.push(entry);
+        //TODO: appropriate error conversion here
+        ProcessLogger::truncate_file(max_size, curr_size, &mut target).expect("");
+    }
+    Ok(())
+}
+
 pub async fn truncate_stream_to_file(
     max_size: u64,
     mut curr_size: u64,
@@ -592,7 +794,7 @@ pub async fn truncate_stream_to_file(
             }
         }
         //TODO: appropriate error conversion here
-        ProcessLogger::truncate_file(max_size, curr_size, &mut target).expect("");
+        ProcessLogger::truncate_file(max_size as usize, curr_size as usize, &mut target).expect("");
     }
     Ok(())
 }

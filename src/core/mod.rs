@@ -1,4 +1,4 @@
-mod device;
+pub mod device;
 pub mod logging;
 pub mod platform;
-mod task;
+pub mod task;

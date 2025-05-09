@@ -45,6 +45,8 @@ impl LinuxCurrentTask {
         let mut lock = me.lock().await;
         let _ = lock.inner.sigkill();
     }
+
+    pub fn respawn(&mut self) {}
 }
 
 #[derive(Debug, PartialEq)]

@@ -7,7 +7,14 @@ use std::io::Seek;
 use std::io::Write;
 use std::path::PathBuf;
 
+use circular_buffer::CircularBuffer;
+
+use termcolor::ColorSpec;
+
+use termcolor::WriteColor;
 use thiserror::Error;
+use time::error::IndeterminateOffset;
+use time::OffsetDateTime;
 
 use crate::core::platform::linux::LinuxAsyncLines;
 use crate::core::task::TaskError;
@@ -38,6 +45,8 @@ pub enum LoggingError {
     IOError(#[from] std::io::Error),
     #[error("{}", .0)]
     TaskError(#[from] TaskError),
+    #[error("Time init error: {}", .0)]
+    TimeError(#[from] IndeterminateOffset),
 }
 
 type LogOpResult<T> = Result<T, LoggingError>;
@@ -64,12 +73,12 @@ pub struct ProcessLogger {
 
 impl ProcessLogger {
     //define a truncate policy later
-    pub fn truncate_file(max_len: u64, curr_len: u64, fhandle: &mut File) -> LogOpResult<()> {
+    pub fn truncate_file(max_len: usize, curr_len: usize, fhandle: &mut File) -> LogOpResult<()> {
         let value = max_len / 4;
         if curr_len <= max_len {
             return Ok(()); //should be the most common operation
         }
-        fhandle.seek(std::io::SeekFrom::Start(curr_len - value))?;
+        fhandle.seek(std::io::SeekFrom::Start((curr_len - value) as u64))?;
         let mut b = Vec::with_capacity(value as usize);
         fhandle.read_to_end(&mut b)?;
         fhandle.set_len(0)?;
@@ -197,6 +206,133 @@ impl ProcessLogger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogType {
+    Stdout,
+    Stderr,
+    YapmErr,
+    YapmLog,
+    YapmWarning,
+}
+
+impl LogType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogType::Stdout => "Outstream",
+            LogType::Stderr => "Errstream",
+            LogType::YapmErr => "Yapm-Err",
+            LogType::YapmLog => "Yapm-Log",
+            LogType::YapmWarning => "Yapm-Warn",
+        }
+    }
+
+    pub fn colour(&self) -> ColorSpec {
+        let mut spec = ColorSpec::new();
+        match self {
+            LogType::Stdout => {
+                spec.set_fg(Some(termcolor::Color::White));
+            }
+            LogType::Stderr => {
+                //trying to approximate Orange for terminals
+                spec.set_fg(Some(termcolor::Color::Ansi256(214)));
+            }
+            LogType::YapmErr => {
+                spec.set_fg(Some(termcolor::Color::Red))
+                    .set_bold(true)
+                    .set_intense(true);
+            }
+            LogType::YapmLog => {
+                spec.set_fg(Some(termcolor::Color::Blue));
+            }
+            LogType::YapmWarning => {
+                spec.set_fg(Some(termcolor::Color::Yellow))
+                    .set_intense(true);
+            }
+        }
+        spec
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    ty: LogType,
+    timestamp: OffsetDateTime,
+    msg: String,
+}
+
+impl LogEntry {
+    pub fn new(ty: LogType, msg: String) -> LogOpResult<Self> {
+        Ok(Self {
+            ty,
+            timestamp: OffsetDateTime::now_local()?,
+            msg,
+        })
+    }
+
+    pub fn to_fstring(&self) -> String {
+        format!(
+            "{} [{}:{:02}:{:02}, {}-{}-{}] {}\n",
+            self.ty.as_str(),
+            self.timestamp.hour(),
+            self.timestamp.minute(),
+            self.timestamp.second(),
+            self.timestamp.day(),
+            self.timestamp.month(),
+            self.timestamp.year(),
+            self.msg
+        )
+    }
+}
+
+impl std::fmt::Display for LogEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} [{}:{:02}:{:02}, {}-{}-{}] {}\n",
+            self.ty.as_str(),
+            self.timestamp.hour(),
+            self.timestamp.minute(),
+            self.timestamp.second(),
+            self.timestamp.day(),
+            self.timestamp.month(),
+            self.timestamp.year(),
+            self.msg
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogManager {
+    glv: CircularBuffer<100, LogEntry>,
+}
+
+impl LogManager {
+    pub fn new() -> Self {
+        let buf = CircularBuffer::new();
+        Self { glv: buf }
+    }
+
+    pub fn push(&mut self, entry: LogEntry) {
+        self.glv.push_back(entry);
+    }
+
+    //display to the terminal
+    pub fn display(&self, mut n: usize) -> LogOpResult<()> {
+        if n > 100 {
+            n = 100;
+        }
+        let mut stream = termcolor::BufferedStandardStream::stderr(termcolor::ColorChoice::Auto);
+        for e in self.glv.iter().rev().take(n).rev() {
+            let code = e.ty.colour();
+            stream.set_color(&code)?;
+            stream.write(e.to_fstring().as_bytes())?;
+            stream.set_color(&termcolor::ColorSpec::new())?;
+            stream.flush()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +342,46 @@ mod tests {
         //just make sure it doesn't panic
         let first = ProcessLogger::new(102, String::from("test_one"), None, None);
         assert!(true)
+    }
+
+    #[test]
+    fn test_log_entry_formatting() {
+        let time = time::OffsetDateTime::now_local().unwrap();
+        let entry = LogEntry {
+            ty: LogType::Stdout,
+            // timestamp: datetime!(2025-05-09 12:34:56 UTC),
+            timestamp: time,
+            msg: "Hello, World!".into(),
+        };
+
+        let string = format!(
+            "{} [{}:{:02}:{:02}, {}-{}-{}] {}\n",
+            "Outstream",
+            time.hour(),
+            time.minute(),
+            time.second(),
+            time.day(),
+            time.month(),
+            time.year(),
+            "Hello, World!"
+        );
+        assert_eq!(entry.to_fstring(), string);
+    }
+    #[test]
+    fn test_log_manager_push_and_display() {
+        let mut mgr = LogManager::new();
+
+        let entry1 = LogEntry::new(LogType::Stdout, "Entry 1".to_string()).unwrap();
+        let entry2 = LogEntry::new(LogType::Stderr, "Entry 2".to_string()).unwrap();
+        let entry3 = LogEntry::new(LogType::YapmErr, "Error!".to_string()).unwrap();
+        let entry4 = LogEntry::new(LogType::YapmLog, "Log!".to_string()).unwrap();
+        let entry5 = LogEntry::new(LogType::YapmWarning, "Warning".to_string()).unwrap();
+        mgr.push(entry1);
+        mgr.push(entry2);
+        mgr.push(entry3);
+        mgr.push(entry4);
+        mgr.push(entry5);
+
+        mgr.display(5).unwrap();
     }
 }

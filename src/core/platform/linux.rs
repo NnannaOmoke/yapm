@@ -26,6 +26,8 @@ use libseccomp::ScmpSyscall;
 
 pub use nix::errno::Errno;
 
+use nix::libc::syscall;
+use nix::libc::SYS_pidfd_open;
 use nix::libc::STDERR_FILENO;
 use nix::libc::STDOUT_FILENO;
 
@@ -52,7 +54,7 @@ use nix::unistd::fork;
 use nix::unistd::pipe;
 use nix::unistd::read as nix_read;
 use nix::unistd::ForkResult;
-use nix::unistd::Pid;
+pub use nix::unistd::Pid;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -515,6 +517,34 @@ pub fn set_process_mem_max_cgroups(
         _ => {}
     };
     Ok(())
+}
+
+//TODO: implement the GOAT shill's idea here
+pub async fn monitor_process_life(pid: Pid) -> LinuxOpResult<WaitStatus> {
+    // open the pidfd
+    let fd = unsafe {
+        let fd = syscall(SYS_pidfd_open, pid, nix::libc::PIDFD_NONBLOCK);
+        if fd < 0 {
+            return Err(LinuxErrorManager::IOError(std::io::Error::last_os_error()));
+        }
+        //case because syscall returns c_long == i64
+        fd as i32
+    };
+    let async_fd = AsyncFd::new(fd)?; //this takes in i32
+    loop {
+        let _ = async_fd.readable().await?; //the koko of the operation, lmao
+
+        let res = unsafe {
+            nix::sys::wait::waitid(
+                nix::sys::wait::Id::PIDFd(std::os::fd::BorrowedFd::borrow_raw(fd)),
+                WaitPidFlag::WNOHANG,
+            )?
+        };
+        match &res {
+            WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => return Ok(res),
+            _ => continue,
+        }
+    }
 }
 
 // a single place to initialize a seccomp context
