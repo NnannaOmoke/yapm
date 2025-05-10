@@ -17,10 +17,10 @@ use time::error::IndeterminateOffset;
 use time::OffsetDateTime;
 
 use crate::core::platform::linux::LinuxAsyncLines;
+use crate::core::platform::linux::Pid;
 use crate::core::task::TaskError;
-
-use crate::threads::AsyncTask;
-use crate::threads::TaskSender;
+use crate::threads::LoggingTask;
+use crate::threads::TGlobalAsyncIOManager;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_LOG_DIR_LOCATION: &'static str = "/var/log/yapm/";
@@ -68,7 +68,7 @@ pub struct ProcessLogger {
     stderr_size: u64, //get this with file metadata
     stdout_size: u64,
     fmax_size: FMaxSize,
-    pid: i32, //incase we need to do any weird stuff with the linux ABI
+    pid: Pid, //incase we need to do any weird stuff with the linux ABI
 }
 
 impl ProcessLogger {
@@ -153,7 +153,7 @@ impl ProcessLogger {
             stdout_src: None,
             stderr_size: err_size,
             stdout_size: out_size,
-            pid,
+            pid: Pid::from_raw(pid),
         });
     }
 
@@ -162,7 +162,10 @@ impl ProcessLogger {
         self.stdout_src = Some(stdout);
     }
 
-    pub fn send_streaming_task(&mut self, sender: TaskSender) -> LogOpResult<()> {
+    pub fn send_streaming_task(
+        &mut self,
+        sender: impl std::ops::Deref<Target = TGlobalAsyncIOManager>,
+    ) -> LogOpResult<()> {
         if self.stderr_src.is_none()
             || self.stdout_src.is_none()
             || self.stdout.is_none()
@@ -183,25 +186,21 @@ impl ProcessLogger {
         } else {
             usize::MAX
         };
+        //TODO: ifx thhis
+        let _ = sender.submit_logging_task(
+            LoggingTask {
+                max_size,
+                err_size: self.stderr_size as usize,
+                out_size: self.stdout_size as usize,
+                ierr: serr,
+                iout: sout,
+                ferr,
+                fout,
+                pid: self.pid,
+            },
+            "Registering Log task",
+        );
 
-        match sender.send(AsyncTask::StreamLogTask(
-            max_size,
-            self.stderr_size,
-            self.stdout_size,
-            serr,
-            sout,
-            ferr,
-            fout,
-            self.pid,
-        )) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Attempt to send task info while async runtime is unavailable");
-                return Err(LoggingError::AssertionError {
-                    msg: String::from("Attempt to send task info while runtime is unavailable"),
-                });
-            }
-        };
         Ok(())
     }
 }
@@ -261,12 +260,12 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    pub fn new(ty: LogType, msg: String) -> LogOpResult<Self> {
-        Ok(Self {
+    pub fn new(ty: LogType, msg: String) -> Self {
+        Self {
             ty,
-            timestamp: OffsetDateTime::now_local()?,
+            timestamp: OffsetDateTime::now_local().unwrap_or(OffsetDateTime::now_utc()),
             msg,
-        })
+        }
     }
 
     pub fn to_fstring(&self) -> String {
@@ -314,6 +313,10 @@ impl LogManager {
 
     pub fn push(&mut self, entry: LogEntry) {
         self.glv.push_back(entry);
+    }
+
+    pub fn len(&self) -> usize {
+        self.glv.len()
     }
 
     //display to the terminal
@@ -371,11 +374,11 @@ mod tests {
     fn test_log_manager_push_and_display() {
         let mut mgr = LogManager::new();
 
-        let entry1 = LogEntry::new(LogType::Stdout, "Entry 1".to_string()).unwrap();
-        let entry2 = LogEntry::new(LogType::Stderr, "Entry 2".to_string()).unwrap();
-        let entry3 = LogEntry::new(LogType::YapmErr, "Error!".to_string()).unwrap();
-        let entry4 = LogEntry::new(LogType::YapmLog, "Log!".to_string()).unwrap();
-        let entry5 = LogEntry::new(LogType::YapmWarning, "Warning".to_string()).unwrap();
+        let entry1 = LogEntry::new(LogType::Stdout, "Entry 1".to_string());
+        let entry2 = LogEntry::new(LogType::Stderr, "Entry 2".to_string());
+        let entry3 = LogEntry::new(LogType::YapmErr, "Error!".to_string());
+        let entry4 = LogEntry::new(LogType::YapmLog, "Log!".to_string());
+        let entry5 = LogEntry::new(LogType::YapmWarning, "Warning".to_string());
         mgr.push(entry1);
         mgr.push(entry2);
         mgr.push(entry3);

@@ -8,6 +8,8 @@ use std::io::Read;
 use std::io::Result as IOResult;
 
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use std::task::Poll;
@@ -528,21 +530,25 @@ pub async fn monitor_process_life(pid: Pid) -> LinuxOpResult<WaitStatus> {
             return Err(LinuxErrorManager::IOError(std::io::Error::last_os_error()));
         }
         //case because syscall returns c_long == i64
-        fd as i32
+        std::os::fd::OwnedFd::from_raw_fd(fd as i32)
     };
-    let async_fd = AsyncFd::new(fd)?; //this takes in i32
+    let async_fd = AsyncFd::new(fd)?;
     loop {
-        let _ = async_fd.readable().await?; //the koko of the operation, lmao
+        let mut g = async_fd.readable().await?; //the koko of the operation, lmao
 
         let res = unsafe {
             nix::sys::wait::waitid(
-                nix::sys::wait::Id::PIDFd(std::os::fd::BorrowedFd::borrow_raw(fd)),
-                WaitPidFlag::WNOHANG,
+                nix::sys::wait::Id::PIDFd(BorrowedFd::borrow_raw(async_fd.get_ref().as_raw_fd())),
+                WaitPidFlag::WNOHANG | WaitPidFlag::WEXITED,
             )?
         };
+
         match &res {
             WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => return Ok(res),
-            _ => continue,
+            _ => {
+                g.clear_ready();
+                continue;
+            }
         }
     }
 }
@@ -765,5 +771,22 @@ mod test {
         tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
         met.refresh().expect("Well, that didn't work");
         dbg!(&met);
+    }
+
+    #[tokio::test]
+    async fn test_process_lifetime_monitor() {
+        let c = unsafe {
+            create_child_exec_context(String::from("examples/test_proc.sh"), &vec![])
+                .expect("couldn't spawn the process")
+        };
+        let pid = c.pid;
+        dbg!(pid);
+        tokio::spawn(async move {
+            let status = monitor_process_life(pid)
+                .await
+                .expect("Something failed here");
+            dbg!(status);
+        });
+        tokio::time::sleep(tokio::time::Duration::from_secs(9)).await;
     }
 }
