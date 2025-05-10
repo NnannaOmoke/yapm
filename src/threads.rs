@@ -639,6 +639,7 @@ mod tests {
         sleep(Duration::new(2, 0));
         let g = rt.log_queue.blocking_lock();
         assert!(g.len() == 1);
+        drop(g);
         sleep(Duration::new(5, 0));
         let g = rt.log_queue.blocking_lock();
         assert!(g.len() == 2);
