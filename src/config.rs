@@ -440,7 +440,7 @@ impl Default for SecurityPolicy {
     }
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 #[command(name = "yapm", author, version, about, long_about)]
 pub struct CLI {
     #[arg(global = true, long, value_name = "LOG_DIR")]
@@ -449,7 +449,7 @@ pub struct CLI {
     pub command: Command,
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand, Serialize, Deserialize)]
 pub enum Command {
     /// Process management controls
     #[command(subcommand)]
@@ -468,7 +468,7 @@ pub enum Command {
     System(SystemCommands),
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand, Serialize, Deserialize)]
 pub enum ProcessCommands {
     /// Start a new process with the specified arguments
     #[command(visible_alias = "s")]
@@ -482,7 +482,7 @@ pub enum ProcessCommands {
     },
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand, Serialize, Deserialize)]
 pub enum ConfigCommands {
     /// Start a process using a TOML configuration file to define the parameters
     #[command(alias = "run")]
@@ -493,7 +493,7 @@ pub enum ConfigCommands {
     //TODO: add support for generating configuration files
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand, Serialize, Deserialize)]
 pub enum MonitorCommands {
     /// List all running processes, and a brief summary of their resource consumption
     #[command(alias = "ls")]
@@ -516,7 +516,7 @@ pub enum MonitorCommands {
     },
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand, Serialize, Deserialize)]
 pub enum SystemCommands {
     /// Initialize the YAPM daemon
     Init {
@@ -526,9 +526,11 @@ pub enum SystemCommands {
     },
     /// Check the status of the YAPM daemon
     Status,
+    ///Shutdown the daemon, thus terminating all managed processes
+    Shutdown,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct StartArgs {
     /// Process name
     #[arg(short, long, value_name = "NAME")]
@@ -678,7 +680,7 @@ impl SecurityPolicy {
 }
 
 /// Security-related command line arguments
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct SecurityArgs {
     /// Security profile to use (default, isolated, readonly, sandboxed, custom)
     #[arg(long, value_name = "PROFILE")]
@@ -790,7 +792,7 @@ impl std::fmt::Display for ResourceProfile {
 }
 
 // TODO: we might need dedicated parsers for this shit
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct ResourceArgs {
     /// Built in resource to use (light, worker, service, custom)
     #[arg(long, value_name = "PROFILE")]

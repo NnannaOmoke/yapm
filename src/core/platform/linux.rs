@@ -1,3 +1,4 @@
+use crate::config::ProcessConfig;
 use crate::core::platform::consts::LinuxSyscallConsts;
 use crate::core::platform::traits::DisobeyPolicy;
 
@@ -7,14 +8,13 @@ use std::io::BufRead;
 use std::io::Read;
 use std::io::Result as IOResult;
 
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use std::task::Poll;
-
-use cgroups_rs::Resources;
 
 use futures::ready;
 
@@ -42,9 +42,7 @@ use nix::sys::resource::Resource;
 use nix::sys::resource::RLIM_INFINITY;
 
 use nix::sys::signal::kill;
-use nix::sys::signal::SIGCONT;
 use nix::sys::signal::SIGKILL;
-use nix::sys::signal::SIGSTOP;
 
 use nix::sys::wait::waitpid;
 use nix::sys::wait::WaitPidFlag;
@@ -52,6 +50,7 @@ pub use nix::sys::wait::WaitStatus;
 
 use nix::unistd::dup2;
 use nix::unistd::execv;
+use nix::unistd::execve;
 use nix::unistd::fork;
 use nix::unistd::pipe;
 use nix::unistd::read as nix_read;
@@ -113,7 +112,7 @@ pub enum MemReqs {
 
 #[derive(Debug, Error)]
 pub enum LinuxErrorManager {
-    #[error("SIGKILL could not terminate the running process; YAPM does not have the neccessary permissions to terminate the child process")]
+    #[error("YAPM does not have the neccessary permissions to perform this action")]
     SigKillNoPerm,
     #[error(
         "SIGKILL could not terminate the target process; It either does not exist or has been terminated already"
@@ -192,12 +191,12 @@ impl AsyncRead for ManagedStream {
     }
 }
 
-//we just have this for debug purposes right now
 #[derive(Debug)]
 pub struct ManagedLinuxProcess {
     pid: Pid,
     stderr: Option<ManagedStream>,
     stdout: Option<ManagedStream>,
+    pub start: std::time::Instant,
 }
 
 impl ManagedLinuxProcess {
@@ -249,6 +248,7 @@ pub unsafe fn create_child_exec_context(
                 pid: child,
                 stderr: Some(merr),
                 stdout: Some(mout),
+                start: std::time::Instant::now(),
             };
             return Ok(value);
         }
@@ -271,7 +271,111 @@ pub unsafe fn create_child_exec_context(
     };
 }
 
-#[cfg(debug_assertions)]
+pub unsafe fn create_child_exec_context_from_config(
+    config: ProcessConfig,
+) -> LinuxOpResult<ManagedLinuxProcess> {
+    use std::ffi::CString;
+
+    let (stderr_read_fd, stderr_write_fd) = pipe()?;
+    let (stdout_read_fd, stdout_write_fd) = pipe()?;
+
+    match fork()? {
+        ForkResult::Parent { child } => {
+            let merr = ManagedStream::new(stderr_read_fd)?;
+            let mout = ManagedStream::new(stdout_read_fd)?;
+            Ok(ManagedLinuxProcess {
+                pid: child,
+                stderr: Some(merr),
+                stdout: Some(mout),
+                start: std::time::Instant::now(),
+            })
+        }
+        ForkResult::Child => {
+            // Redirect stdout/stderr
+            dup2(stderr_write_fd.as_raw_fd(), STDERR_FILENO)?;
+            dup2(stdout_write_fd.as_raw_fd(), STDOUT_FILENO)?;
+
+            if let Some(dir) = &config.cwd {
+                std::env::set_current_dir(dir)?;
+            }
+
+            // Resource limits
+            let pid = nix::unistd::getpid().as_raw();
+            // set_process_cpu_priority_rlimit(pid, config.resources.cpu_priority)?;
+            // set_process_mem_max_rlimit(pid, config.resources.mem_limit)?;
+            // set_process_fd_max_rlimit(pid, config.resources.fd_limit)?;
+
+            // Security enforcement
+            let mut ctx = init_seccomp_context()?;
+            let sec = &config.security;
+
+            if sec.no_net {
+                seccomp_no_net(&mut ctx, DisobeyPolicy::NoPerm)?;
+            }
+
+            if sec.no_fs {
+                seccomp_no_fs(&mut ctx, DisobeyPolicy::NoPerm)?;
+            } else if sec.read_only_fs {
+                seccomp_readonly_fs(&mut ctx, DisobeyPolicy::NoPerm)?;
+            }
+
+            if sec.no_process {
+                seccomp_no_proc(&mut ctx, DisobeyPolicy::NoPerm)?;
+            }
+
+            if sec.no_thread {
+                seccomp_no_thread(&mut ctx, DisobeyPolicy::NoPerm)?;
+            }
+
+            if sec.no_ipc {
+                seccomp_no_ipc(&mut ctx, DisobeyPolicy::NoPerm)?;
+            }
+
+            if sec.no_sysman {
+                seccomp_no_sys(&mut ctx, DisobeyPolicy::NoPerm)?;
+            }
+
+            ctx.load()?; // Apply filter
+
+            let target = CString::new(config.command.clone()).unwrap();
+            let mut final_env: std::collections::HashMap<String, String> =
+                std::env::vars().collect();
+
+            for (k, v) in &config.env {
+                final_env.insert(k.clone(), v.clone());
+            }
+
+            let envp: Vec<CString> = final_env
+                .iter()
+                .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap())
+                .collect();
+
+            let mut argv: Vec<CString> = vec![target.clone()];
+            for arg in &config.args {
+                argv.push(CString::new(arg.clone()).unwrap());
+            }
+            let argv_ptrs: Vec<_> = argv
+                .iter()
+                .map(|f| CString::from_vec_unchecked(f.clone().into_bytes()))
+                .collect();
+
+            // let mut env = Vec::new();
+            // for (k, v) in &config.env {
+            //     let kv = format!("{}={}", k, v);
+            //     env.push(CString::new(kv).unwrap());
+            // }
+            // let envp_ptrs: Vec<_> = env
+            //     .iter()
+            //     .map(|f| CString::from_vec_unchecked(f.clone().into_bytes()))
+            //     .collect();
+
+            use nix::unistd::execvpe;
+            execvpe(target.as_c_str(), &argv_ptrs, &envp)?;
+            unreachable!("execve failed unexpectedly");
+        }
+    }
+}
+
 pub unsafe fn test_create_child_exec_context(
     target: String,
     args: &[String],
@@ -288,6 +392,7 @@ pub unsafe fn test_create_child_exec_context(
                 pid: child,
                 stderr: Some(merr),
                 stdout: Some(mout),
+                start: std::time::Instant::now(),
             };
             return Ok(value);
         }
@@ -317,24 +422,24 @@ pub unsafe fn test_create_child_exec_context(
 #[derive(Debug, Default)]
 pub struct LinuxRuntimeMetrics {
     //
-    vmrss_kb: usize,
-    vmswap_kb: usize,
-    vmsize_kb: usize,
-    vmhwm_kb: usize,
-    rssanon_kb: usize,
-    rssfile_kb: usize,
-    rssshmem_kb: usize,
+    pub vmrss_kb: usize,
+    pub vmswap_kb: usize,
+    pub vmsize_kb: usize,
+    pub vmhwm_kb: usize,
+    pub rssanon_kb: usize,
+    pub rssfile_kb: usize,
+    pub rssshmem_kb: usize,
 
     //cpu stuff
-    uptime: usize,
-    kernel_time: usize,
-    children_uptime: usize,
-    children_kerneltime: usize,
-    nthreads: usize,
+    pub uptime: usize,
+    pub kernel_time: usize,
+    pub children_uptime: usize,
+    pub children_kerneltime: usize,
+    pub nthreads: usize,
 
     //io stuff
-    read_bytes: usize,
-    write_bytes: usize,
+    pub read_bytes: usize,
+    pub write_bytes: usize,
 
     //file handles
     status_file: Option<std::fs::File>,
@@ -349,7 +454,6 @@ impl LinuxRuntimeMetrics {
     //this is the only function that will use it in the first place
     pub fn new(pid: Pid) -> LinuxOpResult<Self> {
         let mut metrics = Self::default();
-
         let status = format!("/proc/{}/status", pid);
         metrics.status_file = Some(Self::open_file(&status)?);
         let stat = format!("/proc/{}/stat", pid);
@@ -360,20 +464,30 @@ impl LinuxRuntimeMetrics {
     }
 
     pub fn refresh(&mut self) -> LinuxOpResult<()> {
-        self.parse_mem_status()?;
-        self.parse_io_status()?;
-        self.parse_cpu_status()?;
+        self.parse_mem_status().unwrap();
+        self.parse_io_status().unwrap();
+        self.parse_cpu_status().unwrap();
         Ok(())
     }
 
     fn open_file(path: &str) -> LinuxOpResult<std::fs::File> {
-        Ok(std::fs::OpenOptions::new()
+        let mut file = std::fs::File::options()
+            .read(true)
+            .create(true)
+            .write(true)
+            .append(true)
+            .open("syslog.txt")
+            .unwrap();
+        let mut fs = std::fs::OpenOptions::new()
             .read(true)
             .write(false)
             .create(false)
             .append(false)
             .create_new(false)
-            .open(path)?)
+            .open(path)?;
+        writeln!(&mut file, "{path}").unwrap();
+        std::io::copy(&mut fs, &mut file).unwrap();
+        Ok(fs)
     }
 
     fn parse_mem_status(&mut self) -> LinuxOpResult<()> {
@@ -421,19 +535,28 @@ impl LinuxRuntimeMetrics {
         let f = self
             .io_file
             .as_ref()
-            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))
+            .unwrap();
         let bufr = std::io::BufReader::new(f);
         //now we need to parse this
         let lines = bufr.lines().take(2).collect::<Result<Vec<_>, _>>()?; //we have all the lines
-                                                                          //the next thing to do is to do this: we need to get the 0th and the 1st line
-        self.read_bytes = lines[0]
+        if lines.len() == 0 {
+            panic!("we can't read io")
+        } //the next thing to do is to do this: we need to get the 0th and the 1st line
+        self.read_bytes = lines
+            .get(0)
+            .unwrap_or(&String::from("rchar: 0"))
             .strip_prefix("rchar: ")
             .and_then(|f| f.parse::<usize>().ok())
-            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
-        self.write_bytes = lines[1]
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))
+            .unwrap();
+        self.write_bytes = lines
+            .get(1)
+            .unwrap_or(&String::from("wchar: 0"))
             .strip_prefix("wchar: ")
             .and_then(|f| f.parse::<usize>().ok())
-            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+            .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))
+            .unwrap();
         Ok(())
     }
 
@@ -471,27 +594,39 @@ pub fn kill_process_sigkill(id: i32) -> LinuxOpResult<()> {
     Ok(())
 }
 
-pub fn suspend_process_sigstop(id: i32) -> LinuxOpResult<()> {
-    kill(Pid::from_raw(id), SIGSTOP)?;
-    Ok(())
-}
+// pub fn suspend_process_sigstop(id: i32) -> LinuxOpResult<()> {
+//     kill(Pid::from_raw(id), SIGSTOP)?;
+//     Ok(())
+// }
 
-pub fn start_suspended_process_sigcont(id: i32) -> LinuxOpResult<()> {
-    kill(Pid::from_raw(id), SIGCONT)?;
-    Ok(())
-}
+// pub fn start_suspended_process_sigcont(id: i32) -> LinuxOpResult<()> {
+//     kill(Pid::from_raw(id), SIGCONT)?;
+//     Ok(())
+// }
 
 pub fn set_process_cpu_priority_rlimit(id: i32, cpu_priority: CPUPriority) -> LinuxOpResult<()> {
-    match cpu_priority {
-        //the hard limit here should be _lower_ than the soft limit
-        CPUPriority::Max => setrlimit(Resource::RLIMIT_NICE, RLIM_INFINITY, RLIM_INFINITY)?,
-        CPUPriority::VeryHigh => setrlimit(Resource::RLIMIT_NICE, 2, 1)?,
-        CPUPriority::High => setrlimit(Resource::RLIMIT_NICE, 6, 5)?,
-        CPUPriority::Normal => setrlimit(Resource::RLIMIT_NICE, 10, 9)?,
-        CPUPriority::Low => setrlimit(Resource::RLIMIT_NICE, 12, 11)?,
-        CPUPriority::VeryLow => setrlimit(Resource::RLIMIT_NICE, 15, 14)?,
-        CPUPriority::Lowest => setrlimit(Resource::RLIMIT_NICE, 20, 18)?,
-    };
+    let is_root = unsafe { nix::libc::geteuid() == 0 };
+    if is_root {
+        match cpu_priority {
+            CPUPriority::Max => setrlimit(Resource::RLIMIT_NICE, 40, 40)?,
+            CPUPriority::VeryHigh => setrlimit(Resource::RLIMIT_NICE, 35, 40)?,
+            CPUPriority::High => setrlimit(Resource::RLIMIT_NICE, 30, 40)?,
+            CPUPriority::Normal => setrlimit(Resource::RLIMIT_NICE, 20, 40)?,
+            CPUPriority::Low => setrlimit(Resource::RLIMIT_NICE, 15, 40)?,
+            CPUPriority::VeryLow => setrlimit(Resource::RLIMIT_NICE, 10, 40)?,
+            CPUPriority::Lowest => setrlimit(Resource::RLIMIT_NICE, 5, 40)?,
+        }
+    } else {
+        match cpu_priority {
+            CPUPriority::Max | CPUPriority::VeryHigh | CPUPriority::High | CPUPriority::Normal => {
+                setrlimit(Resource::RLIMIT_NICE, 20, 20)?
+            }
+            CPUPriority::Low => setrlimit(Resource::RLIMIT_NICE, 15, 20)?,
+            CPUPriority::VeryLow => setrlimit(Resource::RLIMIT_NICE, 10, 20)?,
+            CPUPriority::Lowest => setrlimit(Resource::RLIMIT_NICE, 5, 20)?,
+        }
+    }
+
     Ok(())
 }
 
@@ -507,17 +642,10 @@ pub fn set_process_mem_max_rlimit(id: i32, mem_reqs: MemReqs) -> LinuxOpResult<(
     Ok(())
 }
 
-pub fn set_process_mem_max_cgroups(
-    id: i32,
-    mem_reqs: MemReqs,
-    resource: &mut Resources,
-) -> LinuxOpResult<()> {
-    match mem_reqs {
-        MemReqs::Specific(mibs) => {
-            resource.memory.memory_hard_limit = Some(mibs as i64 * 1024 * 1024);
-        }
-        _ => {}
-    };
+pub fn set_process_fd_max_rlimit(id: i32, fd_reqs: Option<usize>) -> LinuxOpResult<()> {
+    if let Some(n) = fd_reqs {
+        setrlimit(Resource::RLIMIT_NOFILE, n as u64 + 3, n as u64 + 3)?
+    }
     Ok(())
 }
 
@@ -551,6 +679,12 @@ pub async fn monitor_process_life(pid: Pid) -> LinuxOpResult<WaitStatus> {
             }
         }
     }
+}
+
+pub fn daemonize() -> LinuxOpResult<()> {
+    use nix::unistd::daemon;
+    daemon(true, true)?;
+    Ok(())
 }
 
 // a single place to initialize a seccomp context

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use circular_buffer::CircularBuffer;
 
+use serde::Deserialize;
+use serde::Serialize;
 use termcolor::ColorSpec;
 
 use termcolor::WriteColor;
@@ -23,7 +25,7 @@ use crate::threads::LoggingTask;
 use crate::threads::TGlobalAsyncIOManager;
 
 #[cfg(target_os = "linux")]
-const DEFAULT_LOG_DIR_LOCATION: &'static str = "/var/log/yapm/";
+const DEFAULT_LOG_DIR_LOCATION: &'static str = "/tmp/log/yapm";
 #[cfg(target_os = "windows")]
 static DEFAULT_LOG_DIR_LOCATION: &'static str = "";
 
@@ -87,7 +89,7 @@ impl ProcessLogger {
         Ok(())
     }
 
-    fn new(
+    pub fn new(
         pid: i32,
         pname: String,
         fstdoutpath: Option<PathBuf>,
@@ -115,11 +117,12 @@ impl ProcessLogger {
                     (outhandle, errhandle)
                 }
             } else {
-                let root = PathBuf::from(DEFAULT_LOG_DIR_LOCATION);
+                let root = PathBuf::from("logs");
                 let stderr_path = PathBuf::from(format!("{}_err.log", pname));
                 let stdout_path = PathBuf::from(format!("{}_output.log", pname));
                 let root_stderr = root.join(&stderr_path);
                 let root_stdout = root.join(&stdout_path);
+                let cwd = std::fs::create_dir("logs");
                 #[cfg(debug_assertions)]
                 {
                     dbg!(&root_stderr);
@@ -205,7 +208,7 @@ impl ProcessLogger {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogType {
     Stdout,
     Stderr,
@@ -252,11 +255,11 @@ impl LogType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-    ty: LogType,
-    timestamp: OffsetDateTime,
-    msg: String,
+    pub ty: LogType,
+    pub timestamp: OffsetDateTime,
+    pub msg: String,
 }
 
 impl LogEntry {
@@ -302,7 +305,7 @@ impl std::fmt::Display for LogEntry {
 
 #[derive(Debug, Clone)]
 pub struct LogManager {
-    glv: CircularBuffer<100, LogEntry>,
+    pub glv: CircularBuffer<100, LogEntry>,
 }
 
 impl LogManager {

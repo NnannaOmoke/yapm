@@ -74,13 +74,13 @@ pub struct LoggingTask {
 }
 
 pub struct MetricsTask {
-    pid: Pid,
-    task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
+    pub pid: Pid,
+    pub task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
 }
 
 pub struct ReviveTask {
-    pid: Pid,
-    task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
+    pub pid: Pid,
+    pub task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +106,15 @@ pub struct TaskInfo {
     status: TaskStatus,
     created: OffsetDateTime,
     desc: String,
+}
+
+impl TaskInfo {
+    fn kill(&mut self) {
+        for h in self.handles.iter() {
+            h.abort()
+        }
+        self.handles = vec![]
+    }
 }
 
 pub struct TaskRegistry {
@@ -191,7 +200,7 @@ impl TaskRegistry {
 }
 
 pub struct TGlobalAsyncIOManager {
-    rt: Runtime,
+    pub rt: Runtime,
 
     log_sender: UnboundedSender<(TaskId, LoggingTask)>,
     metrics_sender: UnboundedSender<(TaskId, MetricsTask)>,
@@ -258,29 +267,33 @@ impl TGlobalAsyncIOManager {
         self.state = RuntimeState::Running;
     }
 
+    pub fn enter(&self) -> tokio::runtime::EnterGuard {
+        self.rt.enter()
+    }
+
     fn is_runtime_up(&self) -> bool {
         matches!(self.state, RuntimeState::Running)
     }
 
-    pub fn submit_logging_task(&self, task: LoggingTask, desc: &str) -> AsyncResult<TaskId> {
+    pub async fn submit_logging_task(&self, task: LoggingTask, desc: &str) -> AsyncResult<TaskId> {
         if !self.is_runtime_up() {
             return Err(AsyncError::UnitializedRuntimeError);
         }
 
         let pid = task.pid;
-        let mut registry = self.registry.blocking_lock();
+        let mut registry = self.registry.lock().await;
         let id = registry.allocate();
         registry.register_task(id, pid, TaskType::Logging, desc.to_string());
         self.log_sender.send((id, task))?;
         Ok(id)
     }
 
-    pub fn submit_metrics_task(&self, task: MetricsTask, desc: &str) -> AsyncResult<TaskId> {
+    pub async fn submit_metrics_task(&self, task: MetricsTask, desc: &str) -> AsyncResult<TaskId> {
         if !self.is_runtime_up() {
             return Err(AsyncError::UnitializedRuntimeError);
         }
         let pid = task.pid;
-        let mut registry = self.registry.blocking_lock();
+        let mut registry = self.registry.lock().await;
         let tasks = registry.get_tasks_by_pid(pid);
         if tasks
             .iter()
@@ -297,7 +310,7 @@ impl TGlobalAsyncIOManager {
     }
 
     //we have to perform the sanity check here, it's not enough to do it in the fn itself
-    pub fn submit_process_monitoring_task(
+    pub async fn submit_process_monitoring_task(
         &self,
         task: ReviveTask,
         desc: &str,
@@ -306,7 +319,7 @@ impl TGlobalAsyncIOManager {
             return Err(AsyncError::UnitializedRuntimeError);
         }
         let pid = task.pid;
-        let mut registry = self.registry.blocking_lock();
+        let mut registry = self.registry.lock().await;
         let tasks = registry.get_tasks_by_pid(pid);
         if tasks
             .iter()
@@ -317,7 +330,7 @@ impl TGlobalAsyncIOManager {
             return Err(AsyncError::InconsistentRuntimeState);
         };
         let id = registry.allocate();
-        registry.register_task(id, pid, TaskType::Metrics, desc.to_string());
+        registry.register_task(id, pid, TaskType::Process, desc.to_string());
         self.process_sender.send((id, task))?;
         Ok(id)
     }
@@ -400,9 +413,12 @@ impl TGlobalAsyncIOManager {
             .collect()
     }
 
-    pub async fn kill_runtime(self) {
-        self.rt
-            .shutdown_timeout(tokio::time::Duration::from_millis(500));
+    pub async fn kill_runtime(&self) {
+        let mut g = self.registry.lock().await;
+        for h in g.tasks.values_mut() {
+            h.kill();
+        }
+        // self.state = RuntimeState::Unavailable;
     }
 
     async fn logging_coordinator(
@@ -439,7 +455,6 @@ impl TGlobalAsyncIOManager {
                             e.to_string()
                         )),
                     );
-                    let lock = log.lock().await;
                     //TODO: write something so that YAPM can log that this failed
                 }
             });
@@ -511,7 +526,9 @@ impl TGlobalAsyncIOManager {
                 let interval = tokio::time::Duration::from_millis(20);
                 loop {
                     let mut g = task_arc.lock().await;
-                    let _ = g.metrics.refresh(); //TODO: log failure with YAPM
+
+                    g.metrics.refresh().unwrap(); //TODO: log failure with YAPM
+
                     tokio::time::sleep(interval).await;
                 }
             });
@@ -544,6 +561,17 @@ impl TGlobalAsyncIOManager {
                 }
             };
         }
+    }
+
+    pub async fn get_logs(&self, n: usize) -> Vec<LogEntry> {
+        let g = self.log_queue.lock().await;
+        g.glv.iter().rev().take(n).map(|x| x.clone()).collect()
+    }
+
+    pub async fn log(&self, input: String, ty: LogType) {
+        let entry = LogEntry::new(ty, input);
+        let mut g = self.log_queue.lock().await;
+        g.push(entry);
     }
 }
 
@@ -593,6 +621,7 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn init_async_runtime() {
         let fout = File::options()
@@ -645,6 +674,7 @@ mod tests {
         assert!(g.len() == 2);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn test_async_io_task_kill_t() {
         let rt = TGlobalAsyncIOManager::new().expect("The GAM could not be entered");
