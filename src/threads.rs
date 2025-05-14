@@ -1,3 +1,5 @@
+use crate::Device;
+
 use crate::core::logging::LogEntry;
 use crate::core::logging::LogManager;
 use crate::core::logging::LogType;
@@ -33,6 +35,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use tokio::task::JoinHandle;
 
+use tracing::instrument;
+
 #[derive(Debug, Error)]
 pub enum AsyncError {
     #[error("Unknown Error")]
@@ -62,6 +66,7 @@ impl<T> From<tokio::sync::mpsc::error::SendError<T>> for AsyncError {
 type AsyncResult<T> = Result<T, AsyncError>;
 type TaskId = usize;
 
+#[derive(Debug)]
 pub struct LoggingTask {
     pub max_size: usize,
     pub err_size: usize,
@@ -80,7 +85,7 @@ pub struct MetricsTask {
 
 pub struct ReviveTask {
     pub pid: Pid,
-    pub task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +122,7 @@ impl TaskInfo {
     }
 }
 
+#[derive(Debug)]
 pub struct TaskRegistry {
     tasks: HashMap<TaskId, TaskInfo>,
     pid_index: HashMap<Pid, Vec<TaskId>>,
@@ -199,6 +205,7 @@ impl TaskRegistry {
     }
 }
 
+#[derive(Debug)]
 pub struct TGlobalAsyncIOManager {
     pub rt: Runtime,
 
@@ -212,7 +219,7 @@ pub struct TGlobalAsyncIOManager {
 }
 
 impl TGlobalAsyncIOManager {
-    pub fn new() -> AsyncResult<Self> {
+    pub fn new(device: Arc<Device>) -> AsyncResult<Arc<Self>> {
         let (ltx, lrx) = unbounded_channel();
         let (mtx, mrx) = unbounded_channel();
         let (ptx, prx) = unbounded_channel();
@@ -224,24 +231,29 @@ impl TGlobalAsyncIOManager {
         let registry = Arc::new(AsyncMutex::new(TaskRegistry::new()));
         let lqueue = Arc::new(AsyncMutex::new(LogManager::new()));
 
-        let mut manager = Self {
+        let manager = Self {
             rt,
             log_sender: ltx,
             metrics_sender: mtx,
             process_sender: ptx,
             registry,
             log_queue: lqueue,
-            state: RuntimeState::Unavailable,
+            state: RuntimeState::Running, //cop-out
         };
-        manager.start_runtime(lrx, mrx, prx);
-        Ok(manager)
+
+        let arc = Arc::new(manager);
+        let rt = arc.clone();
+        arc.start_runtime(rt, lrx, mrx, prx, device);
+        Ok(arc)
     }
 
     fn start_runtime(
-        &mut self,
+        &self,
+        rmain: Arc<TGlobalAsyncIOManager>, //self referential bs, anyone?
         lrx: UnboundedReceiver<(TaskId, LoggingTask)>,
         mtx: UnboundedReceiver<(TaskId, MetricsTask)>,
         rtx: UnboundedReceiver<(TaskId, ReviveTask)>,
+        device: Arc<Device>,
     ) {
         let registry = self.registry.clone();
         let log_queue = self.log_queue.clone();
@@ -260,11 +272,11 @@ impl TGlobalAsyncIOManager {
 
         self.rt.spawn(Self::revive_coordinator(
             rtx,
+            device,
+            rmain,
             log_queue.clone(),
             registry.clone(),
         ));
-
-        self.state = RuntimeState::Running;
     }
 
     pub fn enter(&self) -> tokio::runtime::EnterGuard {
@@ -275,15 +287,19 @@ impl TGlobalAsyncIOManager {
         matches!(self.state, RuntimeState::Running)
     }
 
+    #[instrument]
     pub async fn submit_logging_task(&self, task: LoggingTask, desc: &str) -> AsyncResult<TaskId> {
         if !self.is_runtime_up() {
             return Err(AsyncError::UnitializedRuntimeError);
         }
 
         let pid = task.pid;
+        tracing::debug!("Let's get the registry lock now!");
         let mut registry = self.registry.lock().await;
+        tracing::debug!("We've gotten the registry lock");
         let id = registry.allocate();
         registry.register_task(id, pid, TaskType::Logging, desc.to_string());
+        tracing::debug!("We're sending the logging task over to the runtime now!");
         self.log_sender.send((id, task))?;
         Ok(id)
     }
@@ -421,11 +437,13 @@ impl TGlobalAsyncIOManager {
         // self.state = RuntimeState::Unavailable;
     }
 
+    #[instrument]
     async fn logging_coordinator(
         mut rx: UnboundedReceiver<(TaskId, LoggingTask)>,
         registry: Arc<AsyncMutex<TaskRegistry>>,
         glv: Arc<AsyncMutex<LogManager>>,
     ) {
+        tracing::debug!("We've entered the logging co-ordinator now");
         while let Some((
             id,
             LoggingTask {
@@ -442,10 +460,12 @@ impl TGlobalAsyncIOManager {
         {
             let reg = registry.clone();
             let log = glv.clone();
+            tracing::debug!("We're spawning the error handle now");
             let ehandle = tokio::spawn(async move {
                 if let Err(e) =
                     Self::truncate_stream_stderr(ierr, ferr, log.clone(), max_size, err_size).await
                 {
+                    tracing::debug!("An error has occured in the streaming function");
                     let mut g = reg.lock().await;
                     let _ = g.update_status(
                         id,
@@ -523,7 +543,7 @@ impl TGlobalAsyncIOManager {
             //perform a check if this task is already running for this pid in the registry
             //asynchronous, execution proceeds to the next rust-truction
             let handle = tokio::spawn(async move {
-                let interval = tokio::time::Duration::from_millis(20);
+                let interval = tokio::time::Duration::from_secs(1);
                 loop {
                     let mut g = task_arc.lock().await;
 
@@ -537,24 +557,31 @@ impl TGlobalAsyncIOManager {
         }
     }
 
+    #[instrument]
     pub async fn revive_coordinator(
         mut rx: UnboundedReceiver<(TaskId, ReviveTask)>,
+        device: Arc<Device>,
+        rt: Arc<TGlobalAsyncIOManager>,
         log_queue: Arc<AsyncMutex<LogManager>>,
         registry: Arc<AsyncMutex<TaskRegistry>>,
     ) {
-        while let Some((id, ReviveTask { pid, task_arc })) = rx.recv().await {
+        while let Some((id, ReviveTask { pid, name })) = rx.recv().await {
             //we're about to do sorcery
-            match monitor_process_life(Pid::from(pid)).await {
+            let pid = Pid::from(pid);
+            match monitor_process_life(pid).await {
                 Ok(status) => {
-                    //we have to deal with this
-                    let mut g = task_arc.lock().await;
-                    let name = g.config.name.clone();
                     //TODO: add exit code and shit like that in a bit
+                    let rt = rt.clone();
+                    tracing::debug!("We try to acquire this lock");
+                    let _ = rt.kill_tasks_by_pid(pid).await;
+                    tracing::debug!("We have acquired the lock!");
                     let entry = LogEntry::new(
                         LogType::YapmLog,
                         "Process with name: {name} and pid: {pid} has exited".to_string(),
                     );
-                    g.respawn();
+                    let _ = device.evaluate_restart(&name, rt).await;
+                    tracing::debug!("The restart has been evaluated, and info returned");
+                    continue;
                 }
                 Err(e) => {
                     //we also have to deal with this
@@ -575,11 +602,13 @@ impl TGlobalAsyncIOManager {
     }
 }
 
+#[derive(Debug)]
 enum RuntimeState {
     Running,
     Unavailable,
 }
 
+#[instrument]
 pub async fn async_truncate_stream_to_file(
     max_size: usize,
     mut curr_size: usize,
@@ -594,6 +623,7 @@ pub async fn async_truncate_stream_to_file(
         LogType::Stderr
     };
     while let Some(line) = source.next_line().await? {
+        tracing::debug!("We enter this loop");
         let entry = LogEntry::new(tstream, line);
         let complete = entry.to_fstring();
         target.write(complete.as_bytes())?;

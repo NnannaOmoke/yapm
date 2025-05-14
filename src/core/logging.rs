@@ -18,6 +18,8 @@ use thiserror::Error;
 use time::error::IndeterminateOffset;
 use time::OffsetDateTime;
 
+use tracing::instrument;
+
 use crate::core::platform::linux::LinuxAsyncLines;
 use crate::core::platform::linux::Pid;
 use crate::core::task::TaskError;
@@ -165,10 +167,8 @@ impl ProcessLogger {
         self.stdout_src = Some(stdout);
     }
 
-    pub fn send_streaming_task(
-        &mut self,
-        sender: impl std::ops::Deref<Target = TGlobalAsyncIOManager>,
-    ) -> LogOpResult<()> {
+    #[instrument]
+    pub async fn send_streaming_task(&mut self, sender: &TGlobalAsyncIOManager) -> LogOpResult<()> {
         if self.stderr_src.is_none()
             || self.stdout_src.is_none()
             || self.stdout.is_none()
@@ -190,19 +190,22 @@ impl ProcessLogger {
             usize::MAX
         };
         //TODO: ifx thhis
-        let _ = sender.submit_logging_task(
-            LoggingTask {
-                max_size,
-                err_size: self.stderr_size as usize,
-                out_size: self.stdout_size as usize,
-                ierr: serr,
-                iout: sout,
-                ferr,
-                fout,
-                pid: self.pid,
-            },
-            "Registering Log task",
-        );
+        tracing::debug!("We've submitted the tasks to the runtime now");
+        sender
+            .submit_logging_task(
+                LoggingTask {
+                    max_size,
+                    err_size: self.stderr_size as usize,
+                    out_size: self.stdout_size as usize,
+                    ierr: serr,
+                    iout: sout,
+                    ferr,
+                    fout,
+                    pid: self.pid,
+                },
+                "Registering Log task",
+            )
+            .await;
 
         Ok(())
     }

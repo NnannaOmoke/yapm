@@ -8,6 +8,7 @@ use std::io::BufRead;
 use std::io::Read;
 use std::io::Result as IOResult;
 
+use std::io::Seek;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
@@ -471,32 +472,24 @@ impl LinuxRuntimeMetrics {
     }
 
     fn open_file(path: &str) -> LinuxOpResult<std::fs::File> {
-        let mut file = std::fs::File::options()
-            .read(true)
-            .create(true)
-            .write(true)
-            .append(true)
-            .open("syslog.txt")
-            .unwrap();
-        let mut fs = std::fs::OpenOptions::new()
+        let fs = std::fs::OpenOptions::new()
             .read(true)
             .write(false)
             .create(false)
             .append(false)
             .create_new(false)
             .open(path)?;
-        writeln!(&mut file, "{path}").unwrap();
-        std::io::copy(&mut fs, &mut file).unwrap();
         Ok(fs)
     }
 
     fn parse_mem_status(&mut self) -> LinuxOpResult<()> {
         //the next thing is that we want to go over each line and split:
         //TODO: create an illegal state error
-        let f = self
+        let mut f = self
             .status_file
             .as_ref()
             .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+        f.seek(std::io::SeekFrom::Start(0))?;
         let bufreader = std::io::BufReader::new(f);
         let lines = bufreader.lines();
         for l in lines {
@@ -532,11 +525,13 @@ impl LinuxRuntimeMetrics {
     }
 
     fn parse_io_status(&mut self) -> LinuxOpResult<()> {
-        let f = self
+        use std::io::Seek;
+        let mut f = self
             .io_file
             .as_ref()
             .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))
             .unwrap();
+        f.seek(std::io::SeekFrom::Start(0))?;
         let bufr = std::io::BufReader::new(f);
         //now we need to parse this
         let lines = bufr.lines().take(2).collect::<Result<Vec<_>, _>>()?; //we have all the lines
@@ -562,10 +557,12 @@ impl LinuxRuntimeMetrics {
 
     fn parse_cpu_status(&mut self) -> LinuxOpResult<()> {
         let mut cont = String::new();
-        let f = self
+        let mut f = self
             .stat_file
             .as_ref()
             .ok_or(LinuxErrorManager::UnexpectedError(Errno::UnknownErrno))?;
+
+        f.seek(std::io::SeekFrom::Start(0))?;
         let mut bufr = std::io::BufReader::new(f);
         bufr.read_to_string(&mut cont)?;
         let metrics = cont.split_whitespace().collect::<Vec<_>>();

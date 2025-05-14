@@ -1,0 +1,216 @@
+/proc/375403/status
+Name:	core::platform:
+Umask:	0022
+State:	R (running)
+Tgid:	375403
+Ngid:	0
+Pid:	375403
+PPid:	375401
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	100	100	100	100
+FDSize:	64
+Groups:	1 57 72 100 302 
+NStgid:	375403
+NSpid:	375403
+NSpgid:	374802
+NSsid:	3126
+Kthread:	0
+VmPeak:	   76896 kB
+VmSize:	   76896 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    2128 kB
+VmRSS:	    2128 kB
+RssAnon:	     464 kB
+RssFile:	    1664 kB
+RssShmem:	       0 kB
+VmData:	    2440 kB
+VmStk:	     152 kB
+VmExe:	    4076 kB
+VmLib:	    2268 kB
+VmPTE:	      64 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	0/63415
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000001000
+SigCgt:	0000000100000440
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+Seccomp_filters:	0
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	f
+Cpus_allowed_list:	0-3
+Mems_allowed:	00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	0
+nonvoluntary_ctxt_switches:	0
+x86_Thread_features:	
+x86_Thread_features_locked:	
+/proc/375403/stat
+375403 (core::platform:) R 375401 374802 3126 34816 374802 4194368 46 0 0 0 0 0 0 0 20 0 1 0 13300626 78741504 532 18446744073709551615 94346068758528 94346072930185 140724624398256 0 0 0 0 4096 1088 0 0 0 17 0 0 0 0 0 0 94346073930496 94346074095808 94346574356480 140724624403479 140724624403573 140724624403573 140724624424885 0
+/proc/375403/io
+rchar: 2003
+wchar: 0
+syscr: 6
+syscw: 0
+read_bytes: 0
+write_bytes: 0
+cancelled_write_bytes: 0
+/proc/384279/status
+Name:	core::platform:
+Umask:	0022
+State:	R (running)
+Tgid:	384279
+Ngid:	0
+Pid:	384279
+PPid:	384277
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	100	100	100	100
+FDSize:	64
+Groups:	1 57 72 100 302 
+NStgid:	384279
+NSpid:	384279
+NSpgid:	383997
+NSsid:	3126
+Kthread:	0
+VmPeak:	   76896 kB
+VmSize:	   76896 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    2128 kB
+VmRSS:	    2128 kB
+RssAnon:	     464 kB
+RssFile:	    1664 kB
+RssShmem:	       0 kB
+VmData:	    2440 kB
+VmStk:	     152 kB
+VmExe:	    4076 kB
+VmLib:	    2268 kB
+VmPTE:	      56 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	0/63415
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000001000
+SigCgt:	0000000100000440
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+Seccomp_filters:	0
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	f
+Cpus_allowed_list:	0-3
+Mems_allowed:	00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	0
+nonvoluntary_ctxt_switches:	0
+x86_Thread_features:	
+x86_Thread_features_locked:	
+/proc/384279/stat
+384279 (core::platform:) R 384277 383997 3126 34816 383997 4194368 47 0 0 0 0 0 0 0 20 0 1 0 13397759 24576 0 18446744073709551615 0 0 0 0 0 0 0 4096 1088 0 0 0 17 2 0 0 0 0 0 0 0 0 0 0 0 0 0
+/proc/384279/io
+rchar: 2003
+wchar: 0
+syscr: 6
+syscw: 0
+read_bytes: 0
+write_bytes: 0
+cancelled_write_bytes: 0
+/proc/385131/status
+Name:	core::platform:
+Umask:	0022
+State:	R (running)
+Tgid:	385131
+Ngid:	0
+Pid:	385131
+PPid:	385129
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	100	100	100	100
+FDSize:	64
+Groups:	1 57 72 100 302 
+NStgid:	385131
+NSpid:	385131
+NSpgid:	384840
+NSsid:	3126
+Kthread:	0
+VmPeak:	   76896 kB
+VmSize:	   76896 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    2252 kB
+VmRSS:	    2252 kB
+RssAnon:	     460 kB
+RssFile:	    1792 kB
+RssShmem:	       0 kB
+VmData:	    2440 kB
+VmStk:	     152 kB
+VmExe:	    4076 kB
+VmLib:	    2268 kB
+VmPTE:	      60 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	0/63415
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000001000
+SigCgt:	0000000100000440
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+Seccomp_filters:	0
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	f
+Cpus_allowed_list:	0-3
+Mems_allowed:	00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	0
+nonvoluntary_ctxt_switches:	0
+x86_Thread_features:	
+x86_Thread_features_locked:	
+/proc/385131/stat
+385131 (core::platform:) R 385129 384840 3126 34816 384840 4194368 47 0 0 0 0 0 0 0 20 0 1 0 13403297 78741504 563 18446744073709551615 94587935748096 94587939920345 140728060944720 0 0 0 0 4096 1088 0 0 0 17 2 0 0 0 0 0 94587940920008 94587941085376 94587980582912 140728060947479 140728060947573 140728060947573 140728060968885 0
+/proc/385131/io
+rchar: 0
+wchar: 0
+syscr: 0
+syscw: 0
+read_bytes: 0
+write_bytes: 0
+cancelled_write_bytes: 0

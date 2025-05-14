@@ -54,7 +54,7 @@ pub fn main() {
 
     let mut c = match std::os::unix::net::UnixStream::connect(DAEMON_SOCKET_ADDR) {
         Ok(c) => c,
-        
+
         Err(e) => {
             let emsg =
                 CommandResult::Error(format!("We could not connect to the YAPM daemon: {e}"));
@@ -77,7 +77,24 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
         std::process::exit(1);
     };
 
-    let runtime = match crate::threads::TGlobalAsyncIOManager::new() {
+    let file = std::fs::File::create("yapm-debug.log").unwrap();
+    let subs = tracing_subscriber::fmt()
+        .with_writer(file)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_target(true)
+        .pretty()
+        .finish();
+    tracing::subscriber::set_global_default(subs).unwrap();
+
+    let span = tracing::Span::current();
+    let _enter = span.enter();
+
+    let device_state = Device::new();
+    //TODO: see the rules for static initialization
+    let rdevice_state = std::sync::Arc::new(device_state);
+
+    let runtime = match crate::threads::TGlobalAsyncIOManager::new(rdevice_state.clone()) {
         Ok(rt) => rt,
         Err(e) => {
             let res =
@@ -87,10 +104,6 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
         }
     };
 
-    let device_state = Device::new();
-    //TODO: see the rules for static initialization
-    let rdevice_state = std::sync::Arc::new(device_state);
-    let runtime = std::sync::Arc::new(runtime);
     let rclone = runtime.clone();
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     runtime.rt.block_on(async move {
@@ -99,11 +112,7 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
             config,
             rdevice_state.clone(),
             rclone.clone(),
-            shutdown.clone(),
-        )
-        .await;
-        // let _ = result.display();
-        
+            shutdown.clone()).await;
         let listener = match tokio::net::UnixListener::bind(DAEMON_SOCKET_ADDR) {
                 Ok(sock) => sock,
                 Err(e) => {
@@ -111,24 +120,14 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
                     let _ = res.display();
                     std::process::exit(1);
                 }
-            };
+        };
         loop {
-            let shutdown = shutdown.clone();
-            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                rclone
-                    .log(
-                        "Shutdown signal received, terminating listener loop".to_string(),
-                        core::logging::LogType::YapmLog,
-                    )
-                    .await;
-                break;
-            }
-            // break;
+            let sclone = shutdown.clone();
             match listener.accept().await {
                 Ok((mut stream, _addr)) => {
                     let runtime_clone = rclone.clone();
                     let device_clone = rdevice_state.clone();
-
+                    let shutdown_clone = sclone.clone();
                     tokio::spawn(async move {
                         let mut buffer = Vec::new();
                         if let Err(e) = stream.read_to_end(&mut buffer).await {
@@ -143,7 +142,7 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
                                     cmd,
                                     device_clone.clone(),
                                     runtime_clone.clone(),
-                                    shutdown,
+                                    shutdown_clone,
                                 )
                                 .await;
                                 reply(&mut stream, &result, &runtime_clone).await
@@ -154,6 +153,17 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
                                 ));
                                 reply(&mut stream, &emsg, &runtime_clone).await
                             }
+                        }
+                        //WORKAROUDN TO GET THIS TO WORK
+                        if sclone.load(std::sync::atomic::Ordering::SeqCst) {
+                            runtime_clone
+                                .log(
+                                    "Daemon listener loop finished. Process will now exit.".to_string(),
+                                    core::logging::LogType::YapmLog,
+                                )
+                                .await;
+                            let _ = std::fs::remove_file(DAEMON_SOCKET_ADDR);
+                            std::process::exit(0);
                         }
                     });
                 }
@@ -181,16 +191,8 @@ pub fn self_daemonize_and_process(config: CLI) -> ! {
                 }
             }
         }
-        rclone
-            .log(
-                "Daemon listener loop finished. Process will now exit.".to_string(),
-                core::logging::LogType::YapmLog,
-            )
-            .await;
-        let _ = std::fs::remove_file(DAEMON_SOCKET_ADDR);
-        std::process::exit(0);
     });
-    unreachable!("Execution never gets here");
+    unreachable!();
 }
 
 pub async fn handle_command<
@@ -307,11 +309,17 @@ pub async fn handle_system_cmd(
             if std::path::Path::new(DAEMON_SOCKET_ADDR).exists() {
                 let _ = std::fs::remove_file(DAEMON_SOCKET_ADDR);
             }
+            tracing::debug!("Does anything happen here?");
             device.stop_all().await;
             rt.kill_runtime().await;
+            tracing::debug!("We've killed all the resources, is there a potential deadlock?");
             shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-            std::process::exit(0);
-            // CommandResult::Success(format!("Shutdown process initiated, Daemon is terminating"))
+            tracing::debug!(
+                "Shutdown value after being set: {}",
+                shutdown.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            // std::process::exit(0);
+            CommandResult::Success(format!("Shutdown process initiated, Daemon is terminating"))
         }
     }
 }
@@ -336,7 +344,9 @@ pub fn send_task(stream: &mut UnixStream, cfg: &CLI) -> CommandResult {
     }
     match serde_json::from_str(&response) {
         Ok(s) => s,
-        Err(e) => CommandResult::Error(format!("Deserializing the response object failed: {e} - {response}")),
+        Err(e) => CommandResult::Error(format!(
+            "Deserializing the response object failed: {e} - {response}"
+        )),
     }
 }
 

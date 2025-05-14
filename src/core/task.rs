@@ -31,6 +31,7 @@ pub enum TaskError {
 type TaskResult<T> = Result<T, TaskError>;
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 pub struct LinuxCurrentTask {
     pub config: ProcessConfig,
     pub inner: ManagedLinuxProcess,
@@ -50,7 +51,21 @@ impl LinuxCurrentTask {
         let _ = lock.inner.sigkill();
     }
 
-    pub fn respawn(&mut self) {}
+    pub fn respawn(&mut self) -> bool {
+        //check respawn policy
+        match self.config.restart {
+            crate::config::RestartPolicy::Capped(value) => {
+                if value <= 1 {
+                    false
+                } else {
+                    self.config.restart = crate::config::RestartPolicy::Capped(value - 1);
+                    true
+                }
+            }
+            crate::config::RestartPolicy::None => false,
+            crate::config::RestartPolicy::Infinite => true,
+        }
+    }
 }
 
 #[cfg(test)]

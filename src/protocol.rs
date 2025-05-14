@@ -4,8 +4,6 @@ use serde::Serialize;
 use termcolor::ColorSpec;
 use termcolor::WriteColor;
 
-use time::format_description::well_known::Iso8601;
-
 use std::io::Write;
 
 use crate::config::ResourceLimits;
@@ -65,19 +63,15 @@ impl CommandResult {
                 spec.set_fg(Some(termcolor::Color::Blue)).set_bold(true);
                 stream.set_color(&spec)?;
                 writeln!(stream, "Log Entries:")?;
-                stream.reset()?;
+                stream.flush()?;
 
                 for entry in vector {
                     // Use the LogEntry's own color formatting
-                    stream.set_color(&entry.ty.colour())?;
-                    write!(
-                        stream,
-                        "[{}] [{}] ",
-                        entry.timestamp.format(&Iso8601::DEFAULT).unwrap(),
-                        entry.ty.as_str()
-                    )?;
-                    writeln!(stream, "{}", entry.msg)?;
-                    stream.reset()?;
+                    let code = entry.ty.colour();
+                    stream.set_color(&code)?;
+                    stream.write(entry.to_fstring().as_bytes())?;
+                    stream.set_color(&termcolor::ColorSpec::new())?;
+                    stream.flush()?;
                 }
             }
             CommandResult::ProcessList { list } => {
