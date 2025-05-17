@@ -1,3 +1,5 @@
+use crate::core::device::ProcessRegistry;
+use crate::core::device::RestartRequest;
 use crate::Device;
 
 use crate::core::logging::LogEntry;
@@ -18,7 +20,9 @@ use std::fs::File;
 use std::io::Write;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
+use nix::sys::wait::WaitStatus;
 use thiserror::Error;
 
 use time::error::IndeterminateOffset;
@@ -36,6 +40,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use tracing::instrument;
+use tracing::instrument::WithSubscriber;
 
 #[derive(Debug, Error)]
 pub enum AsyncError {
@@ -53,11 +58,21 @@ pub enum AsyncError {
     InconsistentRuntimeState,
     #[error("Sending the task to the runtime failed: {}", .msg)]
     TaskSendError { msg: String },
+    #[error("Error acquiring the mutex lock: {}", .msg)]
+    MutexError { msg: String },
 }
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for AsyncError {
     fn from(value: tokio::sync::mpsc::error::SendError<T>) -> Self {
         Self::TaskSendError {
+            msg: value.to_string(),
+        }
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for AsyncError {
+    fn from(value: std::sync::PoisonError<T>) -> Self {
+        Self::MutexError {
             msg: value.to_string(),
         }
     }
@@ -78,9 +93,16 @@ pub struct LoggingTask {
     pub pid: Pid,
 }
 
+//TODO: refactor these tasks
+
 pub struct MetricsTask {
     pub pid: Pid,
     pub task_arc: Arc<AsyncMutex<LinuxCurrentTask>>,
+}
+
+pub struct Metrics {
+    pub pid: Pid,
+    pub name: String,
 }
 
 pub struct ReviveTask {
@@ -116,7 +138,7 @@ pub struct TaskInfo {
 impl TaskInfo {
     fn kill(&mut self) {
         for h in self.handles.iter() {
-            h.abort()
+            h.abort();
         }
         self.handles = vec![]
     }
@@ -202,6 +224,428 @@ impl TaskRegistry {
             }
             None => Err(AsyncError::TaskNotFound),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct AsyncRuntime {
+    pub rt: Runtime,
+
+    log_sender: UnboundedSender<(TaskId, LoggingTask)>,
+    metrics_sender: UnboundedSender<(TaskId, Metrics)>,
+    process_sender: UnboundedSender<(TaskId, ReviveTask)>,
+
+    t_registry: Arc<Mutex<TaskRegistry>>,
+    log_queue: Arc<Mutex<LogManager>>,
+
+    prestart_tx: UnboundedSender<RestartRequest>,
+    p_registry: Arc<ProcessRegistry>,
+
+    state: RuntimeState,
+}
+
+impl AsyncRuntime {
+    pub fn new(
+        prestart_tx: UnboundedSender<RestartRequest>,
+        log_manager: Arc<Mutex<LogManager>>,
+        p_registry: Arc<ProcessRegistry>,
+    ) -> AsyncResult<Self> {
+        let (ltx, lrx) = unbounded_channel();
+        let (mtx, mrx) = unbounded_channel();
+        let (ptx, prx) = unbounded_channel();
+        //if you don't specify the number of threads, it will use the number available to the system
+        let rt = Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("YAPM async handler")
+            .build()?;
+
+        let t_registry = Arc::new(Mutex::new(TaskRegistry::new()));
+
+        let mut manager = AsyncRuntime {
+            rt,
+            log_sender: ltx,
+            metrics_sender: mtx,
+            process_sender: ptx,
+            t_registry,
+            log_queue: log_manager,
+            prestart_tx,
+            p_registry,
+            state: RuntimeState::Unavailable,
+        };
+        manager.start_runtime(lrx, mrx, prx)?;
+        Ok(manager)
+    }
+
+    pub fn start_runtime(
+        &mut self,
+        lrx: UnboundedReceiver<(TaskId, LoggingTask)>,
+        mrx: UnboundedReceiver<(TaskId, Metrics)>,
+        rrx: UnboundedReceiver<(TaskId, ReviveTask)>,
+    ) -> AsyncResult<()> {
+        let pregistry = self.p_registry.clone();
+        let tregistry = self.t_registry.clone();
+        let log_queue = self.log_queue.clone();
+        let prestart_tx = self.prestart_tx.clone();
+
+        self.rt.spawn(Self::logging_coordinator(
+            lrx,
+            tregistry.clone(),
+            log_queue.clone(),
+        ));
+
+        self.rt.spawn(Self::metrics_coordinator(
+            mrx,
+            pregistry.clone(),
+            tregistry.clone(),
+            log_queue.clone(),
+        ));
+
+        self.rt.spawn(Self::revive_coordinator(
+            rrx,
+            tregistry,
+            pregistry,
+            prestart_tx,
+            log_queue,
+        ));
+
+        Ok(())
+    }
+
+    fn is_runtime_up(&self) -> bool {
+        matches!(self.state, RuntimeState::Running)
+    }
+
+    pub async fn submit_logging_task(
+        &self,
+        task: LoggingTask,
+        desc: String,
+    ) -> AsyncResult<TaskId> {
+        let pid = task.pid;
+        let mut registry = self.t_registry.lock()?;
+        let id = registry.allocate();
+        registry.register_task(id, pid, TaskType::Logging, desc);
+        self.log_sender.send((id, task))?;
+        Ok(id)
+    }
+
+    pub async fn submit_metrics_task(&self, task: Metrics, desc: String) -> AsyncResult<TaskId> {
+        let pid = task.pid;
+        let mut registry = self.t_registry.lock()?;
+        let tasks = registry.get_tasks_by_pid(pid);
+        if tasks
+            .iter()
+            .find(|tinfo| tinfo.ty == TaskType::Metrics)
+            .is_some()
+        {
+            let mut g = self.log_queue.lock()?;
+            g.push(LogEntry::new(LogType::YapmErr, format!("Inconsistent runtime state due to race condition; Process {} has spawned duplicate metrics collation tasks", pid)));
+            drop(g); //just in case
+            return Err(AsyncError::InconsistentRuntimeState);
+        }
+        let id = registry.allocate();
+        registry.register_task(id, pid, TaskType::Metrics, desc);
+        self.metrics_sender.send((id, task))?;
+        Ok(id)
+    }
+
+    pub async fn submit_process_monitoring_task(
+        &self,
+        task: ReviveTask,
+        desc: &str,
+    ) -> AsyncResult<TaskId> {
+        let pid = task.pid;
+        let mut registry = self.t_registry.lock()?;
+
+        let tasks = registry.get_tasks_by_pid(pid);
+        if tasks
+            .iter()
+            .find(|tinfo| tinfo.ty == TaskType::Process)
+            .is_some()
+        {
+            let mut g = self.log_queue.lock()?;
+            g.push(LogEntry::new(LogType::YapmErr, format!("Inconsistent runtime state due to race condition; Process {} has spawned duplicate process lifetime monitoring tasks", pid)));
+            drop(g); //just in case
+            return Err(AsyncError::InconsistentRuntimeState);
+        };
+        let id = registry.allocate();
+        registry.register_task(id, pid, TaskType::Process, desc.to_string());
+        self.process_sender.send((id, task))?;
+        Ok(id)
+    }
+
+    pub fn kill_tasks_by_pid(&self, pid: Pid) -> AsyncResult<()> {
+        let mut registry = self.t_registry.lock()?;
+        let tids = if let Some(tids) = registry.pid_index.get(&pid) {
+            tids.clone()
+        } else {
+            return Ok(());
+        };
+        //cheap clone; this is about 4 elements
+        for id in tids.into_iter() {
+            if let Some(task) = registry.get_task_mut(id) {
+                for h in task.handles.iter_mut() {
+                    h.abort()
+                }
+                task.status = TaskStatus::Completed;
+            }
+        }
+        drop(registry);
+        Ok(())
+    }
+
+    pub async fn kill_runtime(&self) -> AsyncResult<()> {
+        let mut g = self.t_registry.lock()?;
+        for h in g.tasks.values_mut() {
+            h.kill();
+        }
+        Ok(())
+    }
+
+    pub async fn logging_coordinator(
+        mut rx: UnboundedReceiver<(TaskId, LoggingTask)>,
+        registry: Arc<Mutex<TaskRegistry>>,
+        logger: Arc<Mutex<LogManager>>,
+    ) {
+        while let Some((
+            id,
+            LoggingTask {
+                max_size,
+                err_size,
+                out_size,
+                ierr,
+                iout,
+                ferr,
+                fout,
+                pid,
+            },
+        )) = rx.recv().await
+        {
+            let log = logger.clone();
+            let reg = registry.clone();
+
+            let ohandle = tokio::spawn(async move {
+                if let Err(e) =
+                    Self::truncate_stream_stdout(iout, fout, log.clone(), max_size, out_size).await
+                {
+                    let mut g = reg.lock().unwrap();
+                    let _ = g.update_status(
+                        id,
+                        TaskStatus::Failed(format!(
+                            "Output streaming has failed for task-id: {}: {}",
+                            id,
+                            e.to_string()
+                        )),
+                    );
+                    drop(g);
+                    let mut l = log.lock().unwrap();
+                    l.push(LogEntry::new(
+                        LogType::YapmWarning,
+                        format!(
+                            "Output streaming has failed for task-id: {} - pid: {}",
+                            id, pid
+                        ),
+                    ));
+                    drop(l);
+                }
+            });
+            let log = logger.clone();
+            let reg = registry.clone();
+            let ehandle = tokio::spawn(async move {
+                if let Err(e) =
+                    Self::truncate_stream_stderr(ierr, ferr, log.clone(), max_size, err_size).await
+                {
+                    tracing::debug!("An error has occured in the streaming function");
+                    let mut g = reg.lock().unwrap();
+                    let _ = g.update_status(
+                        id,
+                        TaskStatus::Failed(format!(
+                            "Error streaming has failed for task-id: {}: {}",
+                            id,
+                            e.to_string()
+                        )),
+                    );
+                    drop(g);
+                    let mut l = log.lock().unwrap();
+                    l.push(LogEntry::new(
+                        LogType::YapmWarning,
+                        format!(
+                            "Output streaming has failed for task-id: {} - pid: {}",
+                            id, pid
+                        ),
+                    ));
+                    drop(l);
+                }
+            });
+            let mut rlock = registry.lock().unwrap();
+            let _ = rlock.add_handle(id, ehandle);
+            let _ = rlock.add_handle(id, ohandle);
+        }
+    }
+
+    async fn metrics_coordinator(
+        mut rx: UnboundedReceiver<(TaskId, Metrics)>,
+        process_registry: Arc<ProcessRegistry>,
+        task_registry: Arc<Mutex<TaskRegistry>>,
+        logger: Arc<Mutex<LogManager>>,
+    ) {
+        while let Some((id, Metrics { pid, name })) = rx.recv().await {
+            let t_reg = task_registry.clone();
+            let log = logger.clone();
+            let p_reg = process_registry.clone();
+            let handle = tokio::spawn(async move {
+                let interval = tokio::time::Duration::from_secs(1);
+                loop {
+                    let mut g = match p_reg.tasks.get_mut(&name) {
+                        Some(g) => g,
+                        None => {
+                            let mut log_lock = log.lock().unwrap();
+                            log_lock.push(LogEntry::new(LogType::YapmErr, format!("Inconsistent runtime state, race condition detected for process: {name} while collecting metrics")));
+                            let mut t_reg_lock = t_reg.lock().unwrap();
+                            let _ = t_reg_lock.update_status(id, TaskStatus::Failed(format!("Inconsistent runtime state, race condition detected for process: {name} while collecting metrics")));
+                            drop(t_reg_lock);
+                            drop(log_lock);
+                            break; //leave the task
+                        }
+                    };
+                    match g.metrics.refresh() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let mut log_lock = log.lock().unwrap();
+                            log_lock.push(LogEntry::new(
+                                LogType::YapmErr,
+                                format!("Collating metrics for process name: {name} failed: {e}"),
+                            ));
+                            let mut t_reg_lock = t_reg.lock().unwrap();
+                            let _ = t_reg_lock.update_status(
+                                id,
+                                TaskStatus::Failed(format!(
+                                    "Collating metrics for process name: {name} failed: {e}"
+                                )),
+                            );
+                            drop(t_reg_lock);
+                            drop(log_lock);
+                            drop(g);
+                            break;
+                        }
+                    }
+                    drop(g);
+                }
+            });
+            let mut rlock = task_registry.lock().unwrap();
+            let _ = rlock.add_handle(id, handle);
+        }
+    }
+
+    pub async fn revive_coordinator(
+        mut rx: UnboundedReceiver<(TaskId, ReviveTask)>,
+        task_registry: Arc<Mutex<TaskRegistry>>,
+        process_registry: Arc<ProcessRegistry>,
+        tx: UnboundedSender<RestartRequest>,
+        logger: Arc<Mutex<LogManager>>,
+    ) {
+        while let Some((id, ReviveTask { pid, name })) = rx.recv().await {
+            let pid = Pid::from(pid);
+            let log = logger.clone();
+            let tx = tx.clone();
+            let treg = task_registry.clone();
+            let handle = tokio::spawn(async move {
+                match monitor_process_life(pid).await {
+                    Ok(status) => {
+                        match status {
+                            WaitStatus::Exited(pid, code) => {
+                                let mut log_lock = log.lock().unwrap();
+                                log_lock.push(LogEntry::new(LogType::YapmLog, format!("The process with name: {name} exited with status code: {code}")));
+                            }
+                            WaitStatus::Signaled(pid, sig, _) => {
+                                let mut log_lock = log.lock().unwrap();
+                                log_lock.push(LogEntry::new(LogType::YapmLog, format!("The process with name: {name} was terminated with signal: {sig}. ")));
+                            }
+                            _ => {}
+                        }
+                        //now we tell the overreaching `ProcessManager` that we have something to kill:
+                        tx.send(RestartRequest { name }).unwrap();
+                    }
+                    Err(e) => {
+                        let mut log_lock = log.lock().unwrap();
+                        log_lock.push(LogEntry::new(
+                            LogType::YapmErr,
+                            format!("Managing the process lifetime has failed; The error: {e}"),
+                        ));
+                        let mut rlock = treg.lock().unwrap();
+                        let _ = rlock.update_status(
+                            id,
+                            TaskStatus::Failed(format!(
+                                "Managing the process lifetime has failed; The error: {e}"
+                            )),
+                        ); //honestly, we don't care very much about the above, so that's why we're cavalier with it
+                        return; //leave the async task; it's done
+                    }
+                }
+            });
+
+            let mut rlock = task_registry.lock().unwrap();
+            let _ = rlock.add_handle(id, handle);
+        }
+    }
+
+    pub async fn truncate_stream_stderr(
+        stderr: LinuxAsyncLines,
+        ferr: File,
+        glv: Arc<Mutex<LogManager>>,
+        max_size: usize,
+        curr_size: usize,
+    ) -> AsyncResult<()> {
+        Self::async_truncate_stream_to_file(max_size, curr_size, stderr, ferr, glv, true).await?;
+        Ok(())
+    }
+
+    pub async fn truncate_stream_stdout(
+        stdout: LinuxAsyncLines,
+        fout: File,
+        glv: Arc<Mutex<LogManager>>,
+        max_size: usize,
+        curr_size: usize,
+    ) -> AsyncResult<()> {
+        Self::async_truncate_stream_to_file(
+            max_size as usize,
+            curr_size as usize,
+            stdout,
+            fout,
+            glv,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn async_truncate_stream_to_file(
+        max_size: usize,
+        mut curr_size: usize,
+        mut source: LinuxAsyncLines,
+        mut target: File,
+        inter: Arc<Mutex<LogManager>>,
+        tstream: bool,
+    ) -> AsyncResult<()> {
+        let tstream = if tstream {
+            LogType::Stdout
+        } else {
+            LogType::Stderr
+        };
+        while let Some(line) = source.next_line().await? {
+            tracing::debug!("We enter this loop");
+            let entry = LogEntry::new(tstream, line);
+            let complete = entry.to_fstring();
+            target.write(complete.as_bytes())?;
+            target.flush()?;
+            curr_size += complete.len();
+            let mut lock = inter.lock()?;
+            lock.push(entry);
+            //TODO: appropriate error conversion here
+            ProcessLogger::truncate_file(max_size, curr_size, &mut target)
+                .inspect_err(|e| panic!("{}", e.to_string()))
+                .expect("");
+        }
+        Ok(())
     }
 }
 

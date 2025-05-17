@@ -994,7 +994,6 @@ mod tests {
 
     #[test]
     fn test_partial_cli_and_toml_equivalence() {
-        // Test with minimal CLI arguments
         let cli_args = vec![
             "yapm",
             "process",
@@ -1006,19 +1005,15 @@ mod tests {
             "hello world",
         ];
 
-        // Parse CLI arguments
         let parsed_cli = CLI::try_parse_from(cli_args).expect("Failed to parse CLI args");
 
-        // Extract the start args from the CLI
         let start_args = match parsed_cli.command {
             Command::Process(ProcessCommands::Start(args)) => args,
             _ => panic!("Unexpected command type"),
         };
 
-        // Convert to ProcessConfig
         let cli_config = ProcessConfig::from(start_args);
 
-        // Create equivalent TOML string
         let toml_str = r#"
             name = "minimal-service"
             command = "/bin/echo"
@@ -1028,7 +1023,6 @@ mod tests {
         // Parse TOML string
         let toml_config: ProcessConfig = toml::from_str(toml_str).expect("Failed to parse TOML");
 
-        // Compare the two configs
         assert_eq!(cli_config.name, toml_config.name);
         assert_eq!(cli_config.command, toml_config.command);
         assert_eq!(cli_config.args, toml_config.args);
@@ -1038,7 +1032,6 @@ mod tests {
         assert_eq!(cli_config.env, toml_config.env);
         assert_eq!(cli_config.log_dir, toml_config.log_dir);
 
-        // Compare resource limits (should be defaults)
         assert_eq!(cli_config.resources.profile, toml_config.resources.profile);
         assert_eq!(
             cli_config.resources.cpu_priority,
@@ -1053,7 +1046,6 @@ mod tests {
             toml_config.resources.fd_limit
         );
 
-        // Compare security policies (should be defaults)
         assert_eq!(cli_config.security.profile, toml_config.security.profile);
         assert_eq!(cli_config.security.no_net, toml_config.security.no_net);
         assert_eq!(cli_config.security.no_fs, toml_config.security.no_fs);
