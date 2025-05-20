@@ -44,7 +44,7 @@ impl ProcessRegistry {
 
 pub struct ProcessManager {
     registry: Arc<ProcessRegistry>,
-    runtime: Arc<AsyncRuntime>,
+    pub runtime: Arc<AsyncRuntime>,
     logger: Arc<StdMutex<LogManager>>,
     restart_sender: UnboundedSender<RestartRequest>,
 }
@@ -441,6 +441,17 @@ impl ProcessManager {
                 }
             }
         });
+    }
+
+    pub fn get_logs(&self, n: usize) -> Vec<LogEntry> {
+        let g = self.logger.lock().unwrap();
+        g.glv.iter().rev().take(n).map(|t| t.clone()).collect()
+    }
+
+    pub fn log(&self, entry: LogEntry) {
+        let mut g = self.logger.lock().unwrap();
+        g.push(entry);
+        drop(g);
     }
 }
 

@@ -25,6 +25,7 @@ mod config;
 mod core;
 mod protocol;
 mod threads;
+mod utils;
 
 const DAEMON_SOCKET_ADDR: &'static str = "/tmp/yapmd.sock";
 
