@@ -30,7 +30,7 @@ windows-sys = "0.59.0"
 
 
 [profile.release]
-strip = "symbols"       
+strip = true       
 lto = true              
 codegen-units = 1       
 opt-level = "z"         

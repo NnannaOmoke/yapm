@@ -24,7 +24,6 @@ use crate::core::platform::linux::LinuxAsyncLines;
 use crate::core::platform::linux::Pid;
 use crate::core::task::TaskError;
 use crate::threads::LoggingTask;
-use crate::threads::TGlobalAsyncIOManager;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_LOG_DIR_LOCATION: &'static str = "/tmp/log/yapm";
@@ -165,49 +164,6 @@ impl ProcessLogger {
     pub fn set_handles(&mut self, stderr: LinuxAsyncLines, stdout: LinuxAsyncLines) {
         self.stderr_src = Some(stderr);
         self.stdout_src = Some(stdout);
-    }
-
-    #[instrument]
-    pub async fn send_streaming_task(&mut self, sender: &TGlobalAsyncIOManager) -> LogOpResult<()> {
-        if self.stderr_src.is_none()
-            || self.stdout_src.is_none()
-            || self.stdout.is_none()
-            || self.stderr.is_none()
-        {
-            return Err(LoggingError::AssertionError {
-                msg: String::from("There is no valid I/O source"),
-            });
-        }
-
-        //we literally just made the check above though, so yeah
-        let ferr = self.stderr.take().expect("");
-        let fout = self.stdout.take().expect("");
-        let serr = self.stderr_src.take().expect("");
-        let sout = self.stdout_src.take().expect("");
-        let max_size = if let FMaxSize::Capped(cap) = self.fmax_size {
-            cap
-        } else {
-            usize::MAX
-        };
-        //TODO: ifx thhis
-        tracing::debug!("We've submitted the tasks to the runtime now");
-        let _ = sender
-            .submit_logging_task(
-                LoggingTask {
-                    max_size,
-                    err_size: self.stderr_size as usize,
-                    out_size: self.stdout_size as usize,
-                    ierr: serr,
-                    iout: sout,
-                    ferr,
-                    fout,
-                    pid: self.pid,
-                },
-                "Registering Log task",
-            )
-            .await;
-
-        Ok(())
     }
 
     pub async fn send_to_runtime(

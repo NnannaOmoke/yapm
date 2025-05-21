@@ -9,13 +9,14 @@ use std::io::Read;
 use std::io::Result as IOResult;
 
 use std::io::Seek;
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use std::task::Poll;
+
+use cgroups_rs::Cgroup;
 
 use futures::ready;
 
@@ -51,7 +52,6 @@ pub use nix::sys::wait::WaitStatus;
 
 use nix::unistd::dup2;
 use nix::unistd::execv;
-use nix::unistd::execve;
 use nix::unistd::fork;
 use nix::unistd::pipe;
 use nix::unistd::read as nix_read;

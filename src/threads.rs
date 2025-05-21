@@ -1,6 +1,5 @@
 use crate::core::device::ProcessRegistry;
 use crate::core::device::RestartRequest;
-use crate::Device;
 
 use crate::core::logging::LogEntry;
 use crate::core::logging::LogManager;
@@ -38,9 +37,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as AsyncMutex;
 
 use tokio::task::JoinHandle;
-
-use tracing::instrument;
-use tracing::instrument::WithSubscriber;
 
 #[derive(Debug, Error)]
 pub enum AsyncError {
@@ -122,6 +118,12 @@ pub enum TaskType {
     Logging,
     Metrics,
     Process,
+}
+
+#[derive(Debug)]
+pub enum RuntimeState {
+    Running,
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -529,6 +531,7 @@ impl AsyncRuntime {
                         }
                     }
                     drop(g);
+                    tokio::time::sleep(interval).await;
                 }
             });
             let mut rlock = task_registry.lock().unwrap();
@@ -644,555 +647,122 @@ impl AsyncRuntime {
             ProcessLogger::truncate_file(max_size, curr_size, &mut target)
                 .inspect_err(|e| panic!("{}", e.to_string()))
                 .expect("");
+            drop(lock);
         }
         Ok(())
     }
 }
 
-#[derive(Debug)]
-pub struct TGlobalAsyncIOManager {
-    pub rt: Runtime,
+// #[cfg(test)]
+// mod tests {
 
-    log_sender: UnboundedSender<(TaskId, LoggingTask)>,
-    metrics_sender: UnboundedSender<(TaskId, MetricsTask)>,
-    process_sender: UnboundedSender<(TaskId, ReviveTask)>,
+//     use crate::core::platform::linux::create_child_exec_context;
 
-    registry: Arc<AsyncMutex<TaskRegistry>>,
-    log_queue: Arc<AsyncMutex<LogManager>>,
-    state: RuntimeState,
-}
+//     use super::*;
 
-impl TGlobalAsyncIOManager {
-    pub fn new(device: Arc<Device>) -> AsyncResult<Arc<Self>> {
-        let (ltx, lrx) = unbounded_channel();
-        let (mtx, mrx) = unbounded_channel();
-        let (ptx, prx) = unbounded_channel();
-        let rt = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .thread_name("YAPM async handler")
-            .build()?;
-        let registry = Arc::new(AsyncMutex::new(TaskRegistry::new()));
-        let lqueue = Arc::new(AsyncMutex::new(LogManager::new()));
+//     use std::fs::File;
 
-        let manager = Self {
-            rt,
-            log_sender: ltx,
-            metrics_sender: mtx,
-            process_sender: ptx,
-            registry,
-            log_queue: lqueue,
-            state: RuntimeState::Running, //cop-out
-        };
+//     use std::thread::sleep;
+//     use std::time::Duration;
 
-        let arc = Arc::new(manager);
-        let rt = arc.clone();
-        arc.start_runtime(rt, lrx, mrx, prx, device);
-        Ok(arc)
-    }
+//     #[cfg(target_os = "windows")]
+//     #[test]
+//     fn init_async_runtime() {
+//         let fout = File::options()
+//             .create(true)
+//             .write(true)
+//             .append(true)
+//             .read(true)
+//             .open("examples/out.txt")
+//             .unwrap();
+//         let ferr = File::options()
+//             .create(true)
+//             .write(true)
+//             .append(true)
+//             .read(true)
+//             .open("examples/err.txt")
+//             .unwrap();
 
-    fn start_runtime(
-        &self,
-        rmain: Arc<TGlobalAsyncIOManager>, //self referential bs, anyone?
-        lrx: UnboundedReceiver<(TaskId, LoggingTask)>,
-        mtx: UnboundedReceiver<(TaskId, MetricsTask)>,
-        rtx: UnboundedReceiver<(TaskId, ReviveTask)>,
-        device: Arc<Device>,
-    ) {
-        let registry = self.registry.clone();
-        let log_queue = self.log_queue.clone();
+//         let rt = TGlobalAsyncIOManager::new().expect("We could not start the runtime");
+//         let _guard = rt.rt.enter();
+//         dbg!(rt.is_runtime_up());
+//         let mut cmd = unsafe {
+//             create_child_exec_context("examples/test_one.sh".to_string(), &vec![])
+//                 .expect("spawning failed")
+//         };
 
-        self.rt.spawn(Self::logging_coordinator(
-            lrx,
-            registry.clone(),
-            log_queue.clone(),
-        ));
+//         let pid = cmd.pid();
+//         let (lout, lerr) = cmd.readers();
+//         let task = rt
+//             .submit_logging_task(
+//                 LoggingTask {
+//                     max_size: 100,
+//                     err_size: 0,
+//                     out_size: 0,
+//                     ierr: lerr,
+//                     iout: lout,
+//                     ferr,
+//                     fout,
+//                     pid: Pid::from_raw(pid),
+//                 },
+//                 "Task spawned or some shit",
+//             )
+//             .expect("This failed");
 
-        self.rt.spawn(Self::metrics_coordinator(
-            mtx,
-            registry.clone(),
-            log_queue.clone(),
-        ));
+//         sleep(Duration::new(2, 0));
+//         let g = rt.log_queue.blocking_lock();
+//         assert!(g.len() == 1);
+//         drop(g);
+//         sleep(Duration::new(5, 0));
+//         let g = rt.log_queue.blocking_lock();
+//         assert!(g.len() == 2);
+//     }
 
-        self.rt.spawn(Self::revive_coordinator(
-            rtx,
-            device,
-            rmain,
-            log_queue.clone(),
-            registry.clone(),
-        ));
-    }
+//     #[cfg(target_os = "windows")]
+//     #[test]
+//     fn test_async_io_task_kill_t() {
+//         let rt = TGlobalAsyncIOManager::new().expect("The GAM could not be entered");
+//         let _guard = rt.rt.enter();
+//         let mut cmds = vec![];
+//         for index in 0..=3 {
+//             let name = format! {"{}_sleep_command", index};
+//             let curr = unsafe {
+//                 create_child_exec_context("examples/test_one.sh".to_string(), &vec![])
+//                     .expect("Failed to spawn process")
+//             };
+//             let ferr = File::create(format! {"examples/ferr_{}.txt", index}).unwrap();
+//             let fout = File::create(format! {"examples/fout_{}.txt", index}).unwrap();
+//             let id = curr.pid();
+//             cmds.push((name, curr, ferr, fout, id as i32))
+//         }
+//         let third_tup_id = cmds[3].4;
+//         for tup in cmds {
+//             let mut cmd = tup.1;
+//             let (cout, cerr) = cmd.readers();
+//             let task = LoggingTask {
+//                 max_size: 10000,
+//                 err_size: 0,
+//                 out_size: 0,
+//                 ierr: cerr,
+//                 iout: cout,
+//                 ferr: tup.2,
+//                 fout: tup.3,
+//                 pid: Pid::from_raw(tup.4),
+//             };
+//             rt.submit_logging_task(task, "Log some stuff for each process")
+//                 .expect("task sending broke");
+//         }
 
-    pub fn enter(&self) -> tokio::runtime::EnterGuard {
-        self.rt.enter()
-    }
+//         sleep(Duration::new(1, 0));
+//         let g = rt.log_queue.blocking_lock();
+//         assert_eq!(g.len(), 4);
+//         drop(g);
+//         rt.kill_tasks_by_pid_test(Pid::from_raw(third_tup_id))
+//             .expect("Well, that failed");
+//         dbg!("we got here!");
 
-    fn is_runtime_up(&self) -> bool {
-        matches!(self.state, RuntimeState::Running)
-    }
-
-    #[instrument]
-    pub async fn submit_logging_task(&self, task: LoggingTask, desc: &str) -> AsyncResult<TaskId> {
-        if !self.is_runtime_up() {
-            return Err(AsyncError::UnitializedRuntimeError);
-        }
-
-        let pid = task.pid;
-        tracing::debug!("Let's get the registry lock now!");
-        let mut registry = self.registry.lock().await;
-        tracing::debug!("We've gotten the registry lock");
-        let id = registry.allocate();
-        registry.register_task(id, pid, TaskType::Logging, desc.to_string());
-        tracing::debug!("We're sending the logging task over to the runtime now!");
-        self.log_sender.send((id, task))?;
-        Ok(id)
-    }
-
-    pub async fn submit_metrics_task(&self, task: MetricsTask, desc: &str) -> AsyncResult<TaskId> {
-        if !self.is_runtime_up() {
-            return Err(AsyncError::UnitializedRuntimeError);
-        }
-        let pid = task.pid;
-        let mut registry = self.registry.lock().await;
-        let tasks = registry.get_tasks_by_pid(pid);
-        if tasks
-            .iter()
-            .find(|tinfo| tinfo.ty == TaskType::Metrics)
-            .is_some()
-        {
-            // TODO: log and return
-            return Err(AsyncError::InconsistentRuntimeState);
-        };
-        let id = registry.allocate();
-        registry.register_task(id, pid, TaskType::Metrics, desc.to_string());
-        self.metrics_sender.send((id, task))?;
-        Ok(id)
-    }
-
-    //we have to perform the sanity check here, it's not enough to do it in the fn itself
-    pub async fn submit_process_monitoring_task(
-        &self,
-        task: ReviveTask,
-        desc: &str,
-    ) -> AsyncResult<TaskId> {
-        if !self.is_runtime_up() {
-            return Err(AsyncError::UnitializedRuntimeError);
-        }
-        let pid = task.pid;
-        let mut registry = self.registry.lock().await;
-        let tasks = registry.get_tasks_by_pid(pid);
-        if tasks
-            .iter()
-            .find(|tinfo| tinfo.ty == TaskType::Process)
-            .is_some()
-        {
-            // TODO: log and return
-            return Err(AsyncError::InconsistentRuntimeState);
-        };
-        let id = registry.allocate();
-        registry.register_task(id, pid, TaskType::Process, desc.to_string());
-        self.process_sender.send((id, task))?;
-        Ok(id)
-    }
-
-    pub async fn kill_task(&self, task_id: TaskId) -> AsyncResult<()> {
-        let mut registry = self.registry.lock().await;
-        let task = registry
-            .get_task_mut(task_id)
-            .ok_or(AsyncError::TaskNotFound)?;
-        for handle in task.handles.iter_mut() {
-            handle.abort()
-        }
-        registry.update_status(task_id, TaskStatus::Completed)?;
-        Ok(())
-    }
-
-    pub async fn kill_tasks_by_pid(&self, pid: Pid) -> AsyncResult<()> {
-        let mut registry = self.registry.lock().await;
-        let tids = if let Some(tids) = registry.pid_index.get(&pid) {
-            tids.clone()
-        } else {
-            return Ok(());
-        };
-
-        for id in tids {
-            if let Some(task) = registry.get_task_mut(id) {
-                for h in task.handles.iter_mut() {
-                    h.abort()
-                }
-                task.status = TaskStatus::Completed;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn kill_tasks_by_pid_test(&self, pid: Pid) -> AsyncResult<()> {
-        let mut registry = self.registry.blocking_lock();
-        let tids = if let Some(tids) = registry.pid_index.get(&pid) {
-            tids.clone()
-        } else {
-            return Ok(());
-        };
-
-        for id in tids {
-            if let Some(task) = registry.get_task_mut(id) {
-                for h in task.handles.iter_mut() {
-                    h.abort()
-                }
-                task.status = TaskStatus::Completed;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn get_task_statuses(&self) -> Vec<(TaskId, Pid, TaskType, TaskStatus, String)> {
-        let registry = self.registry.lock().await;
-        registry
-            .tasks
-            .values()
-            .map(|t| (t.id, t.pid, t.ty.clone(), t.status.clone(), t.desc.clone()))
-            .collect()
-    }
-
-    pub async fn get_task_status(&self, task_id: TaskId) -> AsyncResult<TaskStatus> {
-        let registry = self.registry.lock().await;
-        registry
-            .get_task(task_id)
-            .map(|t| t.status.clone())
-            .ok_or(AsyncError::TaskNotFound)
-    }
-
-    pub async fn get_task_ids_by_pid(&self, pid: Pid) -> Vec<TaskId> {
-        let registry = self.registry.lock().await;
-        registry
-            .get_tasks_by_pid(pid)
-            .iter()
-            .map(|task| task.id)
-            .collect()
-    }
-
-    pub async fn kill_runtime(&self) {
-        let mut g = self.registry.lock().await;
-        for h in g.tasks.values_mut() {
-            h.kill();
-        }
-        // self.state = RuntimeState::Unavailable;
-    }
-
-    #[instrument]
-    async fn logging_coordinator(
-        mut rx: UnboundedReceiver<(TaskId, LoggingTask)>,
-        registry: Arc<AsyncMutex<TaskRegistry>>,
-        glv: Arc<AsyncMutex<LogManager>>,
-    ) {
-        tracing::debug!("We've entered the logging co-ordinator now");
-        while let Some((
-            id,
-            LoggingTask {
-                max_size,
-                err_size,
-                out_size,
-                ierr,
-                iout,
-                ferr,
-                fout,
-                pid,
-            },
-        )) = rx.recv().await
-        {
-            let reg = registry.clone();
-            let log = glv.clone();
-            tracing::debug!("We're spawning the error handle now");
-            let ehandle = tokio::spawn(async move {
-                if let Err(e) =
-                    Self::truncate_stream_stderr(ierr, ferr, log.clone(), max_size, err_size).await
-                {
-                    tracing::debug!("An error has occured in the streaming function");
-                    let mut g = reg.lock().await;
-                    let _ = g.update_status(
-                        id,
-                        TaskStatus::Failed(format!(
-                            "Error streaming has failed for task-id: {}: {}",
-                            id,
-                            e.to_string()
-                        )),
-                    );
-                    //TODO: write something so that YAPM can log that this failed
-                }
-            });
-            let reg = registry.clone();
-            let log = glv.clone();
-            let ohandle = tokio::spawn(async move {
-                if let Err(e) =
-                    Self::truncate_stream_stdout(iout, fout, log.clone(), max_size, out_size).await
-                {
-                    let mut g = reg.lock().await;
-                    let _ = g.update_status(
-                        id,
-                        TaskStatus::Failed(format!(
-                            "Error streaming has failed for task-id: {}: {}",
-                            id,
-                            e.to_string()
-                        )),
-                    );
-                    //TODO: write something so that YAPM can log that this failed
-                }
-            });
-            let mut rlock = registry.lock().await;
-            let _ = rlock.add_handle(id, ehandle);
-            let _ = rlock.add_handle(id, ohandle);
-        }
-    }
-
-    pub async fn truncate_stream_stderr(
-        stderr: LinuxAsyncLines,
-        ferr: File,
-        glv: Arc<AsyncMutex<LogManager>>,
-        max_size: usize,
-        curr_size: usize,
-    ) -> AsyncResult<()> {
-        async_truncate_stream_to_file(max_size, curr_size, stderr, ferr, glv, true).await?;
-        Ok(())
-    }
-
-    pub async fn truncate_stream_stdout(
-        stdout: LinuxAsyncLines,
-        fout: File,
-        glv: Arc<AsyncMutex<LogManager>>,
-        max_size: usize,
-        curr_size: usize,
-    ) -> AsyncResult<()> {
-        async_truncate_stream_to_file(
-            max_size as usize,
-            curr_size as usize,
-            stdout,
-            fout,
-            glv,
-            false,
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn metrics_coordinator(
-        mut rx: UnboundedReceiver<(TaskId, MetricsTask)>,
-        registry: Arc<AsyncMutex<TaskRegistry>>,
-        log_queue: Arc<AsyncMutex<LogManager>>,
-    ) {
-        while let Some((id, MetricsTask { pid, task_arc })) = rx.recv().await {
-            let reg = registry.clone();
-            let log = log_queue.clone();
-            //perform a check if this task is already running for this pid in the registry
-            //asynchronous, execution proceeds to the next rust-truction
-            let handle = tokio::spawn(async move {
-                let interval = tokio::time::Duration::from_secs(1);
-                loop {
-                    let mut g = task_arc.lock().await;
-
-                    g.metrics.refresh().unwrap(); //TODO: log failure with YAPM
-
-                    tokio::time::sleep(interval).await;
-                }
-            });
-            let mut rlock = reg.lock().await;
-            let _ = rlock.add_handle(id, handle);
-        }
-    }
-
-    #[instrument]
-    pub async fn revive_coordinator(
-        mut rx: UnboundedReceiver<(TaskId, ReviveTask)>,
-        device: Arc<Device>,
-        rt: Arc<TGlobalAsyncIOManager>,
-        log_queue: Arc<AsyncMutex<LogManager>>,
-        registry: Arc<AsyncMutex<TaskRegistry>>,
-    ) {
-        while let Some((id, ReviveTask { pid, name })) = rx.recv().await {
-            //we're about to do sorcery
-            let pid = Pid::from(pid);
-            match monitor_process_life(pid).await {
-                Ok(status) => {
-                    //TODO: add exit code and shit like that in a bit
-                    let rt = rt.clone();
-                    tracing::debug!("We try to acquire this lock");
-                    let _ = rt.kill_tasks_by_pid(pid).await;
-                    tracing::debug!("We have acquired the lock!");
-                    let entry = LogEntry::new(
-                        LogType::YapmLog,
-                        "Process with name: {name} and pid: {pid} has exited".to_string(),
-                    );
-                    let _ = device.evaluate_restart(&name, rt).await;
-                    tracing::debug!("The restart has been evaluated, and info returned");
-                    continue;
-                }
-                Err(e) => {
-                    //we also have to deal with this
-                }
-            };
-        }
-    }
-
-    pub async fn get_logs(&self, n: usize) -> Vec<LogEntry> {
-        let g = self.log_queue.lock().await;
-        g.glv.iter().rev().take(n).map(|x| x.clone()).collect()
-    }
-
-    pub async fn log(&self, input: String, ty: LogType) {
-        let entry = LogEntry::new(ty, input);
-        let mut g = self.log_queue.lock().await;
-        g.push(entry);
-    }
-}
-
-#[derive(Debug)]
-enum RuntimeState {
-    Running,
-    Unavailable,
-}
-
-#[instrument]
-pub async fn async_truncate_stream_to_file(
-    max_size: usize,
-    mut curr_size: usize,
-    mut source: LinuxAsyncLines,
-    mut target: File,
-    inter: Arc<AsyncMutex<LogManager>>,
-    tstream: bool,
-) -> AsyncResult<()> {
-    let tstream = if tstream {
-        LogType::Stdout
-    } else {
-        LogType::Stderr
-    };
-    while let Some(line) = source.next_line().await? {
-        tracing::debug!("We enter this loop");
-        let entry = LogEntry::new(tstream, line);
-        let complete = entry.to_fstring();
-        target.write(complete.as_bytes())?;
-        target.flush()?;
-        curr_size += complete.len();
-        let mut lock = inter.lock().await;
-        lock.push(entry);
-        //TODO: appropriate error conversion here
-        ProcessLogger::truncate_file(max_size, curr_size, &mut target)
-            .inspect_err(|e| panic!("{}", e.to_string()))
-            .expect("");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-
-    use crate::core::platform::linux::create_child_exec_context;
-
-    use super::*;
-
-    use std::fs::File;
-
-    use std::thread::sleep;
-    use std::time::Duration;
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn init_async_runtime() {
-        let fout = File::options()
-            .create(true)
-            .write(true)
-            .append(true)
-            .read(true)
-            .open("examples/out.txt")
-            .unwrap();
-        let ferr = File::options()
-            .create(true)
-            .write(true)
-            .append(true)
-            .read(true)
-            .open("examples/err.txt")
-            .unwrap();
-
-        let rt = TGlobalAsyncIOManager::new().expect("We could not start the runtime");
-        let _guard = rt.rt.enter();
-        dbg!(rt.is_runtime_up());
-        let mut cmd = unsafe {
-            create_child_exec_context("examples/test_one.sh".to_string(), &vec![])
-                .expect("spawning failed")
-        };
-
-        let pid = cmd.pid();
-        let (lout, lerr) = cmd.readers();
-        let task = rt
-            .submit_logging_task(
-                LoggingTask {
-                    max_size: 100,
-                    err_size: 0,
-                    out_size: 0,
-                    ierr: lerr,
-                    iout: lout,
-                    ferr,
-                    fout,
-                    pid: Pid::from_raw(pid),
-                },
-                "Task spawned or some shit",
-            )
-            .expect("This failed");
-
-        sleep(Duration::new(2, 0));
-        let g = rt.log_queue.blocking_lock();
-        assert!(g.len() == 1);
-        drop(g);
-        sleep(Duration::new(5, 0));
-        let g = rt.log_queue.blocking_lock();
-        assert!(g.len() == 2);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn test_async_io_task_kill_t() {
-        let rt = TGlobalAsyncIOManager::new().expect("The GAM could not be entered");
-        let _guard = rt.rt.enter();
-        let mut cmds = vec![];
-        for index in 0..=3 {
-            let name = format! {"{}_sleep_command", index};
-            let curr = unsafe {
-                create_child_exec_context("examples/test_one.sh".to_string(), &vec![])
-                    .expect("Failed to spawn process")
-            };
-            let ferr = File::create(format! {"examples/ferr_{}.txt", index}).unwrap();
-            let fout = File::create(format! {"examples/fout_{}.txt", index}).unwrap();
-            let id = curr.pid();
-            cmds.push((name, curr, ferr, fout, id as i32))
-        }
-        let third_tup_id = cmds[3].4;
-        for tup in cmds {
-            let mut cmd = tup.1;
-            let (cout, cerr) = cmd.readers();
-            let task = LoggingTask {
-                max_size: 10000,
-                err_size: 0,
-                out_size: 0,
-                ierr: cerr,
-                iout: cout,
-                ferr: tup.2,
-                fout: tup.3,
-                pid: Pid::from_raw(tup.4),
-            };
-            rt.submit_logging_task(task, "Log some stuff for each process")
-                .expect("task sending broke");
-        }
-
-        sleep(Duration::new(1, 0));
-        let g = rt.log_queue.blocking_lock();
-        assert_eq!(g.len(), 4);
-        drop(g);
-        rt.kill_tasks_by_pid_test(Pid::from_raw(third_tup_id))
-            .expect("Well, that failed");
-        dbg!("we got here!");
-
-        sleep(Duration::new(5, 0));
-        let g = rt.log_queue.blocking_lock();
-        assert_eq!(g.len(), 7);
-    }
-}
+//         sleep(Duration::new(5, 0));
+//         let g = rt.log_queue.blocking_lock();
+//         assert_eq!(g.len(), 7);
+//     }
+// }

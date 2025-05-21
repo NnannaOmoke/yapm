@@ -26,7 +26,8 @@ pub fn entry() {
         Ok(conn) => conn,
         Err(e)
             if e.kind() == std::io::ErrorKind::ConnectionRefused
-                || e.kind() == std::io::ErrorKind::AddrNotAvailable =>
+                || e.kind() == std::io::ErrorKind::AddrNotAvailable
+                || e.kind() == std::io::ErrorKind::NotFound =>
         {
             //the daemon does not exist, nobody's home
             if daemonizable {
@@ -71,6 +72,7 @@ pub fn daemon_init() -> Result<(ProcessManager, tokio::net::UnixListener), Comma
         Ok(man) => man,
         Err(e) => return Err(e),
     };
+    let _entry = manager.runtime.rt.enter();
     let listener = match tokio::net::UnixListener::bind(DAEMON_SOCKET_ADDR) {
         Ok(sock) => sock,
         Err(e) => {
