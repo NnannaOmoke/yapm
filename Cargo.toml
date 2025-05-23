@@ -30,8 +30,17 @@ windows-sys = "0.59.0"
 
 
 [profile.release]
-strip = true       
-lto = true              
+strip = true
+debug = false
+rpath = false
+lto = "fat"              
 codegen-units = 1       
-opt-level = "z"         
+opt-level = "s"         
 panic = "abort"        
+
+[profile.release.build-override]
+opt-level = "s"     # Apply size optimization to build scripts and proc macros
+
+[profile.release.package."*"]
+opt-level = "s"     # Apply size optimization to all dependencies
+codegen-units = 1   # Use single codegen unit for all dependencies

@@ -5,6 +5,7 @@ pkgs.mkShell {
     libseccomp
     #need this shit to manage libseccomp  
     pkg-config
+    bc
     
   ];
   

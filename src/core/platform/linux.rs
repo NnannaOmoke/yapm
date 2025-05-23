@@ -15,7 +15,9 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use std::task::Poll;
+use std::time::Duration;
 
+use cgroups_rs::cgroup_builder::CgroupBuilder;
 use cgroups_rs::Cgroup;
 
 use futures::ready;
@@ -125,6 +127,10 @@ pub enum LinuxErrorManager {
     UnexpectedError(Errno),
     #[error("An IO Operation failed: {}", .0)]
     IOError(#[from] std::io::Error),
+    #[error("Time out on spawning processes")]
+    Timeout,
+    #[error("This error occured when setting cgroup limits: {}", .0)]
+    CgroupError(String),
 }
 
 impl From<Errno> for LinuxErrorManager {
@@ -277,13 +283,30 @@ pub unsafe fn create_child_exec_context_from_config(
 ) -> LinuxOpResult<ManagedLinuxProcess> {
     use std::ffi::CString;
 
+    #[derive(PartialEq)]
+    enum ExecvpeResult {
+        Ok,
+        Failed(Errno),
+    }
+
     let (stderr_read_fd, stderr_write_fd) = pipe()?;
     let (stdout_read_fd, stdout_write_fd) = pipe()?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<ExecvpeResult>();
 
     match fork()? {
         ForkResult::Parent { child } => {
             let merr = ManagedStream::new(stderr_read_fd)?;
             let mout = ManagedStream::new(stdout_read_fd)?;
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(res) => {
+                    if let ExecvpeResult::Failed(errno) = res {
+                        return Err(LinuxErrorManager::UnexpectedError(errno));
+                    }
+                    //otherwise, no need for anything, really
+                }
+                Err(e) => return Err(LinuxErrorManager::Timeout),
+            }
             Ok(ManagedLinuxProcess {
                 pid: child,
                 stderr: Some(merr),
@@ -302,10 +325,10 @@ pub unsafe fn create_child_exec_context_from_config(
 
             // Resource limits
             let pid = nix::unistd::getpid().as_raw();
-            // set_process_cpu_priority_rlimit(pid, config.resources.cpu_priority)?;
-            // set_process_mem_max_rlimit(pid, config.resources.mem_limit)?;
-            // set_process_fd_max_rlimit(pid, config.resources.fd_limit)?;
-
+            let mut cgroup = init_cgroup_context(config.name)?;
+            set_cgroup_mem_limit(&mut cgroup, config.resources.mem_limit)?;
+            set_cgroup_cpu_limit(&mut cgroup, config.resources.cpu_priority)?;
+            load_cgroup_context(&mut cgroup)?;
             // Security enforcement
             let mut ctx = init_seccomp_context()?;
             let sec = &config.security;
@@ -371,7 +394,15 @@ pub unsafe fn create_child_exec_context_from_config(
             //     .collect();
 
             use nix::unistd::execvpe;
-            execvpe(target.as_c_str(), &argv_ptrs, &envp)?;
+            match execvpe(target.as_c_str(), &argv_ptrs, &envp) {
+                Ok(_) => {
+                    let _ = tx.send(ExecvpeResult::Ok);
+                }
+                Err(e) => {
+                    let _ = tx.send(ExecvpeResult::Failed(e)); //the operation failed:
+                                                               //for some reason, if this panics, we really can't do anything about it though
+                }
+            };
             unreachable!("execve failed unexpectedly");
         }
     }
@@ -600,6 +631,82 @@ pub fn kill_process_sigkill(id: i32) -> LinuxOpResult<()> {
 //     kill(Pid::from_raw(id), SIGCONT)?;
 //     Ok(())
 // }
+
+pub fn init_cgroup_context(name: String) -> LinuxOpResult<Cgroup> {
+    let hierarchy = cgroups_rs::hierarchies::auto();
+    let cg = CgroupBuilder::new(&name).build(hierarchy).map_err(|e| {
+        LinuxErrorManager::CgroupError(format!("Error initializing Cgroup context: {e}"))
+    })?;
+    Ok(cg)
+}
+
+pub fn set_cgroup_mem_limit(cgroup: &mut Cgroup, mem_reqs: MemReqs) -> LinuxOpResult<()> {
+    if let Some(mem_c) = cgroup.controller_of::<cgroups_rs::memory::MemController>() {
+        match mem_reqs {
+            MemReqs::Specific(mibs) => {
+                let bytes = (mibs * 1024 * 1024) as i64;
+                mem_c.set_memswap_limit(bytes).map_err(|e| {
+                    LinuxErrorManager::CgroupError(format!(
+                        "Failed to set memory limit for cgroups: {e}"
+                    ))
+                })?;
+            }
+            MemReqs::Unlimited => mem_c.set_limit(-1).map_err(|e| {
+                LinuxErrorManager::CgroupError(format!(
+                    "Failed to set memory limit for cgroups: {e}"
+                ))
+            })?, //do nothing; well, -1 could work, I guess
+        }
+    }
+    Ok(())
+}
+
+pub fn set_cgroup_cpu_limit(cgroup: &mut Cgroup, cpu_priority: CPUPriority) -> LinuxOpResult<()> {
+    let is_root = unsafe { nix::libc::geteuid() == 0 };
+
+    if let Some(cpu_controller) = cgroup.controller_of::<cgroups_rs::cpu::CpuController>() {
+        // For single-process cgroups, CPU quotas are more meaningful than shares
+        let (quota, period) = if is_root {
+            match cpu_priority {
+                CPUPriority::Max => (-1, 100_000), // No quota limit (unlimited)
+                CPUPriority::VeryHigh => (90_000, 100_000), // 90% CPU
+                CPUPriority::High => (75_000, 100_000), // 75% CPU
+                CPUPriority::Normal => (-1, 100_000), // No quota limit
+                CPUPriority::Low => (50_000, 100_000), // 50% CPU
+                CPUPriority::VeryLow => (25_000, 100_000), // 25% CPU
+                CPUPriority::Lowest => (10_000, 100_000), // 10% CPU
+            }
+        } else {
+            // Non-root users get more limited CPU access
+            match cpu_priority {
+                CPUPriority::Max | CPUPriority::VeryHigh | CPUPriority::High => (75_000, 100_000), // 75% max
+                CPUPriority::Normal => (50_000, 100_000), // 50% CPU
+                CPUPriority::Low => (30_000, 100_000),    // 30% CPU
+                CPUPriority::VeryLow => (15_000, 100_000), // 15% CPU
+                CPUPriority::Lowest => (5_000, 100_000),  // 5% CPU
+            }
+        };
+
+        // Set the period first
+        cpu_controller.set_cfs_period(period).map_err(|e| {
+            LinuxErrorManager::CgroupError(format!("Failed to set CPU period: {e}",))
+        })?;
+
+        // Set quota (-1 means no limit)
+        cpu_controller
+            .set_cfs_quota(quota)
+            .map_err(|e| LinuxErrorManager::CgroupError(format!("Failed to set CPU quota: {e}")))?;
+    }
+
+    Ok(())
+}
+
+pub fn load_cgroup_context(cgroup: &mut Cgroup) -> LinuxOpResult<()> {
+    cgroup.create().map_err(|e| {
+        LinuxErrorManager::CgroupError(format!("The cgroup could not be created successfully: {e}"))
+    })?;
+    Ok(())
+}
 
 pub fn set_process_cpu_priority_rlimit(id: i32, cpu_priority: CPUPriority) -> LinuxOpResult<()> {
     let is_root = unsafe { nix::libc::geteuid() == 0 };
