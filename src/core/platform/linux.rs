@@ -298,15 +298,15 @@ pub unsafe fn create_child_exec_context_from_config(
         ForkResult::Parent { child } => {
             let merr = ManagedStream::new(stderr_read_fd)?;
             let mout = ManagedStream::new(stdout_read_fd)?;
-            match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(res) => {
-                    if let ExecvpeResult::Failed(errno) = res {
-                        return Err(LinuxErrorManager::UnexpectedError(errno));
-                    }
-                    //otherwise, no need for anything, really
-                }
-                Err(e) => return Err(LinuxErrorManager::Timeout),
-            }
+            // match rx.recv_timeout(Duration::from_millis(10)) {
+            //     Ok(res) => {
+            //         if let ExecvpeResult::Failed(errno) = res {
+            //             return Err(LinuxErrorManager::UnexpectedError(errno));
+            //         }
+            //         //otherwise, no need for anything, really
+            //     }
+            //     Err(e) => return Err(LinuxErrorManager::Timeout),
+            // }
             Ok(ManagedLinuxProcess {
                 pid: child,
                 stderr: Some(merr),
@@ -394,6 +394,7 @@ pub unsafe fn create_child_exec_context_from_config(
             //     .collect();
 
             use nix::unistd::execvpe;
+            //these arms are no-ops
             match execvpe(target.as_c_str(), &argv_ptrs, &envp) {
                 Ok(_) => {
                     let _ = tx.send(ExecvpeResult::Ok);
@@ -787,6 +788,7 @@ pub async fn monitor_process_life(pid: Pid) -> LinuxOpResult<WaitStatus> {
 
 pub fn daemonize() -> LinuxOpResult<()> {
     use nix::unistd::daemon;
+
     daemon(true, true)?;
     Ok(())
 }

@@ -1,0 +1,14 @@
+Outstream [0:26:52, 26-June-2025] VLC is not supposed to be run as root. Sorry.
+Outstream [0:26:52, 26-June-2025] If you need to use real-time priorities and/or privileged TCP ports
+Outstream [0:26:52, 26-June-2025] you can use vlc-wrapper (make sure it is Set-UID root and
+Outstream [0:26:52, 26-June-2025] cannot be run by non-trusted users first).
+Outstream [0:30:12, 26-June-2025] VLC is not supposed to be run as root. Sorry.
+Outstream [0:30:12, 26-June-2025] If you need to use real-time priorities and/or privileged TCP ports
+Outstream [0:30:12, 26-June-2025] you can use vlc-wrapper (make sure it is Set-UID root and
+Outstream [0:30:12, 26-June-2025] cannot be run by non-trusted users first).
+Outstream [1:12:00, 26-June-2025] [000000002b577520] main libvlc: Running vlc with the default interface. Use 'cvlc' to use vlc without interface.
+Outstream [1:12:00, 26-June-2025] Warning: Ignoring XDG_SESSION_TYPE=wayland on Gnome. Use QT_QPA_PLATFORM=wayland to run on Wayland anyway.
+Outstream [1:12:01, 26-June-2025] [000000002b6089c0] main playlist: playlist is empty
+Outstream [1:12:43, 26-June-2025] [000000002e84a520] main libvlc: Running vlc with the default interface. Use 'cvlc' to use vlc without interface.
+Outstream [1:12:43, 26-June-2025] Warning: Ignoring XDG_SESSION_TYPE=wayland on Gnome. Use QT_QPA_PLATFORM=wayland to run on Wayland anyway.
+Outstream [1:12:43, 26-June-2025] [000000002e8db9c0] main playlist: playlist is empty

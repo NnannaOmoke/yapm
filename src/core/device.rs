@@ -180,6 +180,10 @@ impl ProcessManager {
                 ))
             }
         };
+        self.log(LogEntry::new(
+            LogType::YapmLog,
+            format!("The process: {process} has been terminated by YAPM"),
+        ));
         let pid = Pid::from_raw(v.inner.pid());
         match self.runtime.kill_tasks_by_pid(pid) {
             Ok(_) => {}
@@ -198,6 +202,10 @@ impl ProcessManager {
                 ))
             }
         }
+        self.log(LogEntry::new(
+            LogType::YapmLog,
+            format!("The process: {process} has been terminated by YAPM"),
+        ));
         CommandResult::ProcessStopped { name: process }
     }
 

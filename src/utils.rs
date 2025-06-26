@@ -7,8 +7,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use nix::libc;
-
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::channel;
@@ -70,10 +68,11 @@ pub fn entry() {
 }
 
 pub fn daemon_init() -> Result<(ProcessManager, tokio::net::UnixListener), CommandResult> {
-    let _ = std::fs::remove_file(DAEMON_SOCKET_ADDR);
     let manager = match ProcessManager::init() {
         Ok(man) => man,
-        Err(e) => return Err(e),
+        Err(e) => {
+            return Err(e);
+        }
     };
     let _entry = manager.runtime.rt.enter();
     let listener = match tokio::net::UnixListener::bind(DAEMON_SOCKET_ADDR) {
@@ -345,14 +344,35 @@ fn should_daemonize(cmd: &CLI) -> bool {
 
 #[cfg(target_family = "unix")]
 fn split() {
+    // use std::io::Write;
+
+    // use nix::sched::unshare;
+    // use nix::sched::CloneFlags;
     use nix::unistd::fork;
     use nix::unistd::ForkResult;
+    // //TODO: have this write the error message directly to the socket, I guess
+    // let mut f = std::fs::OpenOptions::new()
+    //     .write(true)
+    //     .truncate(true)
+    //     .create(true)
+    //     .open("debug-info.txt")
+    //     .unwrap();
+    // match unshare(CloneFlags::CLONE_NEWPID) {
+    //     Ok(_) => {
+    //         f.write("The unshare operation was sucessful!".as_bytes())
+    //             .unwrap();
+    //     }
+    //     Err(e) => {
+    //         f.write(format!("{}", e).as_bytes()).unwrap();
+    //     }
+    // };
 
     let pid = unsafe { fork() };
     match pid {
         Ok(ForkResult::Parent { child }) => return, //return from the function, the parent has nothing to do
         Ok(ForkResult::Child) => {
             //the first thing we do is to daemonize
+            // this should be in the new namespace
             if let Err(e) = crate::core::platform::linux::daemonize() {
                 let res = CommandResult::Error(format!("Could not daemonize yapmd: {e}"));
                 let _ = res.display();
